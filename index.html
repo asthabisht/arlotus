@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Ground Effect — Eletre X</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Overpass:wght@400;600;800;900&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --black:#0F0F0F;
+    --yellow:#FFF200;
+    --white:#ECECEC;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%;background:var(--black);overflow:hidden;font-family:"Overpass",-apple-system,system-ui,sans-serif;color:var(--white)}
+  #stage{position:fixed;inset:0;overflow:hidden}
+
+  /* live camera feed */
+  #cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000;
+       transform:scale(1.02);filter:contrast(1.03) saturate(0.92) brightness(0.92)}
+  /* AR overlay */
+  #fx{position:absolute;inset:0;width:100%;height:100%}
+
+  /* HUD */
+  #hud{position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .8s ease}
+  #hud.on{opacity:1}
+  .tick{position:absolute;width:26px;height:26px;border:2px solid var(--yellow)}
+  .tl{top:18px;left:18px;border-right:none;border-bottom:none}
+  .tr{top:18px;right:18px;border-left:none;border-bottom:none}
+  .bl{bottom:18px;left:18px;border-right:none;border-top:none}
+  .br{bottom:18px;right:18px;border-left:none;border-top:none}
+  .lbl{position:absolute;font-weight:800;letter-spacing:.18em;text-transform:uppercase;font-size:11px}
+  #tagTop{top:26px;left:52px;color:var(--yellow)}
+  #tagState{top:26px;right:52px;color:var(--white);opacity:.8}
+  #readout{left:52px;bottom:30px;font-size:12px;line-height:1.6;color:var(--white)}
+  #readout b{color:var(--yellow);font-weight:900;font-variant-numeric:tabular-nums}
+  #hint{position:absolute;bottom:30px;right:52px;text-align:right;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--white);opacity:.55;max-width:44vw}
+
+  /* intro / gate */
+  #gate{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;
+        text-align:center;padding:36px;background:radial-gradient(120% 80% at 50% 30%, #1a1a1a 0%, #0F0F0F 70%);z-index:5}
+  #gate.hide{opacity:0;pointer-events:none;transition:opacity .6s ease}
+  .eyebrow{font-size:11px;letter-spacing:.34em;text-transform:uppercase;color:var(--white);opacity:.7;margin-bottom:26px}
+  .benderwrap{width:210px;height:66px;margin-bottom:30px}
+  h1{font-weight:900;text-transform:uppercase;font-size:clamp(30px,9vw,52px);line-height:.95;letter-spacing:-.01em}
+  h1 .yl{color:var(--yellow)}
+  .sub{margin-top:20px;font-size:14px;line-height:1.55;max-width:300px;color:var(--white);opacity:.82;font-weight:400}
+  #go{margin-top:38px;border:none;background:var(--yellow);color:#0F0F0F;font-family:inherit;font-weight:900;
+      text-transform:uppercase;letter-spacing:.16em;font-size:14px;padding:17px 40px;border-radius:2px;cursor:pointer}
+  #go:active{transform:translateY(1px)}
+  .foot{position:absolute;bottom:20px;left:0;right:0;text-align:center;font-size:9px;letter-spacing:.24em;
+        text-transform:uppercase;color:var(--white);opacity:.4}
+  #err{position:absolute;left:0;right:0;bottom:74px;text-align:center;font-size:12px;color:var(--yellow);
+       padding:0 30px;opacity:0;transition:opacity .3s}
+  #err.on{opacity:1}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="fx"></canvas>
+
+  <div id="hud">
+    <div class="tick tl"></div><div class="tick tr"></div>
+    <div class="tick bl"></div><div class="tick br"></div>
+    <div class="lbl" id="tagTop">Lotus · Eletre X</div>
+    <div class="lbl" id="tagState">Ground Effect · Active</div>
+    <div id="readout">
+      DOWNFORCE&nbsp;&nbsp;<b id="rDf">000</b> kg<br>
+      UNDERBODY FLOW&nbsp;&nbsp;<b id="rFl">000</b> km/h
+    </div>
+    <div id="hint">Tilt your phone · sweep it under the car</div>
+  </div>
+
+  <div id="gate">
+    <div class="eyebrow">The Launch of Eletre X</div>
+    <div class="benderwrap">
+      <!-- the straight line that bends: Lotus design DNA -->
+      <svg viewBox="0 0 210 66" width="210" height="66" aria-hidden="true">
+        <path d="M6 33 L120 33 Q150 33 168 12 L204 12" fill="none" stroke="#FFF200" stroke-width="6" stroke-linecap="square"/>
+      </svg>
+    </div>
+    <h1>Ground<br><span class="yl">Effect</span></h1>
+    <div class="sub">The Type 79 won by moving the air beneath it. Point your phone under the car and watch the floor work.</div>
+    <button id="go">Begin</button>
+    <div id="err"></div>
+    <div class="foot">Turn up brightness · Best in landscape</div>
+  </div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  var video=document.getElementById('cam');
+  var canvas=document.getElementById('fx');
+  var ctx=canvas.getContext('2d');
+  var gate=document.getElementById('gate');
+  var hud=document.getElementById('hud');
+  var errEl=document.getElementById('err');
+  var W=0,H=0,DPR=Math.min(window.devicePixelRatio||1,2);
+
+  function resize(){
+    W=window.innerWidth; H=window.innerHeight;
+    canvas.width=W*DPR; canvas.height=H*DPR;
+    canvas.style.width=W+'px'; canvas.style.height=H+'px';
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  window.addEventListener('resize',resize); resize();
+
+  // ---- device tilt -> parallax ----
+  var tiltX=0, tiltY=0, tTiltX=0, tTiltY=0;
+  function onOrient(e){
+    // gamma: left-right [-90,90], beta: front-back [-180,180]
+    if(e.gamma!=null) tTiltX = Math.max(-1,Math.min(1, e.gamma/45));
+    if(e.beta!=null)  tTiltY = Math.max(-1,Math.min(1, (e.beta-45)/45));
+  }
+
+  // ---- airflow particles ----
+  var P=[], N=220;
+  var floorY=0.72;      // relative y of the "ground plane" the car sits on
+  function seed(){
+    P.length=0;
+    for(var i=0;i<N;i++) P.push(newP(true));
+  }
+  function newP(spread){
+    return {
+      x: spread? Math.random() : -0.05 - Math.random()*0.3,
+      y: 0.30 + Math.random()*0.5,
+      v: 0.0016 + Math.random()*0.0022,
+      w: 0.4 + Math.random()*1.4,
+      a: 0.15 + Math.random()*0.5,
+      life: 0
+    };
+  }
+
+  // ghosted low-slung car underbody silhouette (relative coords), drawn as a diffuser wedge
+  function drawCar(cx, cw){
+    var y=floorY*H;
+    var carW=cw*W, x0=cx*W-carW/2;
+    ctx.save();
+    ctx.globalCompositeOperation='lighter';
+    // underbody glow line
+    var g=ctx.createLinearGradient(x0,0,x0+carW,0);
+    g.addColorStop(0,'rgba(255,242,0,0)');
+    g.addColorStop(.5,'rgba(255,242,0,.5)');
+    g.addColorStop(1,'rgba(255,242,0,0)');
+    ctx.strokeStyle=g; ctx.lineWidth=2;
+    // body top curve
+    ctx.beginPath();
+    ctx.moveTo(x0, y-6);
+    ctx.quadraticCurveTo(x0+carW*0.22, y-64, x0+carW*0.5, y-70);
+    ctx.quadraticCurveTo(x0+carW*0.80, y-66, x0+carW, y-8);
+    ctx.stroke();
+    // floor / diffuser line
+    ctx.strokeStyle='rgba(255,242,0,.28)';
+    ctx.beginPath();
+    ctx.moveTo(x0-20, y);
+    ctx.lineTo(x0+carW*0.82, y);
+    ctx.lineTo(x0+carW, y-18); // diffuser kick-up
+    ctx.stroke();
+    ctx.restore();
+    return {x0:x0, y:y, w:carW};
+  }
+
+  var running=false, t=0;
+  var dfEl=document.getElementById('rDf'), flEl=document.getElementById('rFl');
+  var dfShown=0, flShown=0;
+
+  function frame(){
+    if(!running) return;
+    t++;
+    // ease tilt
+    tiltX += (tTiltX-tiltX)*0.06;
+    tiltY += (tTiltY-tiltY)*0.06;
+
+    // motion-blur fade instead of hard clear
+    ctx.globalCompositeOperation='source-over';
+    ctx.fillStyle='rgba(15,15,15,0.18)';
+    ctx.fillRect(0,0,W,H);
+
+    var px = tiltX*38, py = tiltY*24;
+    var car = drawCar(0.5 + tiltX*0.05, 0.62);
+
+    // airflow
+    ctx.globalCompositeOperation='lighter';
+    for(var i=0;i<P.length;i++){
+      var p=P[i];
+      // accelerate as it passes under the car floor (ground effect: squeeze = speed up)
+      var underCar = (p.x*W > car.x0 && p.x*W < car.x0+car.w);
+      var floorPull = 0;
+      var yPix = p.y*H;
+      var speed = p.v;
+      if(yPix > car.y-70 && yPix < car.y+8){
+        // pull flow toward the floor gap and speed it
+        floorPull = ((car.y-24) - yPix) * 0.0009;
+        if(underCar) speed *= 2.3;
+      }
+      var nx = p.x + speed;
+      var ny = p.y + floorPull*0.4 + Math.sin((p.x*8)+(t*0.02))*0.0006;
+
+      var sx = nx*W + px;
+      var sy = ny*H + py;
+      var len = 10 + speed*6000;
+
+      var grd=ctx.createLinearGradient(sx-len,sy,sx,sy);
+      grd.addColorStop(0,'rgba(255,242,0,0)');
+      grd.addColorStop(1,'rgba(255,242,0,'+p.a+')');
+      ctx.strokeStyle=grd;
+      ctx.lineWidth=p.w;
+      ctx.beginPath();
+      ctx.moveTo(sx-len,sy);
+      ctx.lineTo(sx,sy);
+      ctx.stroke();
+
+      p.x=nx; p.y=ny; p.life++;
+      if(p.x>1.1 || p.life>900){ P[i]=newP(false); }
+    }
+
+    // live readout numbers (tilt-reactive, feels alive)
+    var targetDf = 380 + Math.round(Math.abs(tiltY)*260 + Math.sin(t*0.03)*18);
+    var targetFl = 210 + Math.round(Math.abs(tiltX)*120 + Math.cos(t*0.04)*10);
+    dfShown += (targetDf-dfShown)*0.08;
+    flShown += (targetFl-flShown)*0.08;
+    dfEl.textContent = String(Math.round(dfShown)).padStart(3,'0');
+    flEl.textContent = String(Math.round(flShown)).padStart(3,'0');
+
+    requestAnimationFrame(frame);
+  }
+
+  function showErr(m){ errEl.textContent=m; errEl.classList.add('on'); }
+
+  async function begin(){
+    // 1) motion permission (iOS 13+)
+    try{
+      if(typeof DeviceOrientationEvent!=='undefined' &&
+         typeof DeviceOrientationEvent.requestPermission==='function'){
+        var s=await DeviceOrientationEvent.requestPermission();
+        if(s==='granted') window.addEventListener('deviceorientation',onOrient,true);
+      } else {
+        window.addEventListener('deviceorientation',onOrient,true);
+      }
+    }catch(e){ /* motion optional */ }
+
+    // 2) camera
+    try{
+      var stream=await navigator.mediaDevices.getUserMedia({
+        video:{ facingMode:{ ideal:'environment' }, width:{ideal:1280}, height:{ideal:720} },
+        audio:false
+      });
+      video.srcObject=stream;
+      await video.play();
+    }catch(e){
+      showErr('Camera blocked. Allow camera access, then reload. (HTTPS required.)');
+      return;
+    }
+
+    seed();
+    gate.classList.add('hide');
+    hud.classList.add('on');
+    running=true;
+    requestAnimationFrame(frame);
+  }
+
+  document.getElementById('go').addEventListener('click',begin);
+})();
+</script>
+</body>
+</html>
