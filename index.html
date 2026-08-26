@@ -80,22 +80,23 @@
   var W=0,H=0,DPR=Math.min(window.devicePixelRatio||1,2);
 
   var sc=document.createElement('canvas'), sctx=sc.getContext('2d',{willReadFrequently:true});
-  var SW=0,SH=0, MASK=null, RAW=null, TMP=null;
+  var SW=0,SH=0, MASK=null, RAW=null, TMP=null, SMOOTH=null;
   var useSeg=false;                                  // becomes true once segmentation gives a good mask
 
   // ---- tunables ----
-  var STRANDS=6;        // ribbons in the bundle
-  var GAP=3;            // how far outside the silhouette the bundle sits (px)
-  var SPACING=1.6;      // spacing between strands (px)
-  var BILLOW=9;         // how much the strands wave in/out (px)
-  var FLOWSPEED=2.2;    // speed of light travelling around the outline
+  var STRANDS=5;        // ribbons in the bundle
+  var GAP=16;           // how far OUTSIDE the silhouette the bundle floats (px)
+  var SPACING=1.7;      // spacing between strands (px)
+  var BILLOW=6;         // how much the strands wave in/out (px)
+  var FLOWSPEED=1.7;    // speed of light travelling around the outline
+  var MASKSMOOTH=3;     // spatial smoothing of the silhouette (de-jitter + float around)
 
   function resize(){
     W=window.innerWidth; H=window.innerHeight;
     canvas.width=W*DPR; canvas.height=H*DPR; canvas.style.width=W+'px'; canvas.style.height=H+'px';
     ctx.setTransform(DPR,0,0,DPR,0,0);
     SW=120; SH=Math.max(60,Math.round(SW*H/W)); sc.width=SW; sc.height=SH;
-    MASK=new Float32Array(SW*SH); RAW=new Float32Array(SW*SH); TMP=new Float32Array(SW*SH);
+    MASK=new Float32Array(SW*SH); RAW=new Float32Array(SW*SH); TMP=new Float32Array(SW*SH); SMOOTH=new Float32Array(SW*SH);
   }
   window.addEventListener('resize',resize); resize();
 
@@ -133,18 +134,26 @@
   function plen(p){var L=0;for(var i=1;i<p.length;i++)L+=Math.hypot(p[i][0]-p[i-1][0],p[i][1]-p[i-1][1]);return L;}
   function chaikin(p,n){for(var s=0;s<n;s++){var o=[p[0]];for(var i=0;i<p.length-1;i++){var a=p[i],b=p[i+1];o.push([a[0]*.75+b[0]*.25,a[1]*.75+b[1]*.25]);o.push([a[0]*.25+b[0]*.75,a[1]*.25+b[1]*.75]);}o.push(p[p.length-1]);p=o;}return p;}
   function resample(p,step){if(p.length<2)return p;var o=[p[0]],acc=0,i=1,cx=p[0][0],cy=p[0][1];while(i<p.length){var nx=p[i][0],ny=p[i][1],d=Math.hypot(nx-cx,ny-cy);if(acc+d>=step){var t=(step-acc)/((d)||1e-6);var px=cx+(nx-cx)*t,py=cy+(ny-cy)*t;o.push([px,py]);cx=px;cy=py;acc=0;}else{acc+=d;cx=nx;cy=ny;i++;}}return o;}
-  function maskAt(px,py){var xi=Math.round(px),yi=Math.round(py);if(xi<0||yi<0||xi>=SW||yi>=SH)return 0;return MASK[yi*SW+xi];}
+  function maskAt(px,py){var xi=Math.round(px),yi=Math.round(py);if(xi<0||yi<0||xi>=SW||yi>=SH)return 0;return SMOOTH[yi*SW+xi];}
+  function blurToSmooth(r){ // box-blur MASK -> SMOOTH (keeps MASK intact); softens + de-jitters the outline
+    var x,y,k,acc;
+    for(y=0;y<SH;y++){var row=y*SW;acc=0;for(k=-r;k<=r;k++)acc+=MASK[row+Math.max(0,Math.min(SW-1,k))];
+      for(x=0;x<SW;x++){TMP[row+x]=acc/(2*r+1);acc+=MASK[row+Math.min(SW-1,x+r+1)]-MASK[row+Math.max(0,x-r)];}}
+    for(x=0;x<SW;x++){acc=0;for(k=-r;k<=r;k++)acc+=TMP[Math.max(0,Math.min(SH-1,k))*SW+x];
+      for(y=0;y<SH;y++){SMOOTH[y*SW+x]=acc/(2*r+1);acc+=TMP[Math.min(SH-1,y+r+1)*SW+x]-TMP[Math.max(0,y-r)*SW+x];}}
+  }
 
   // build screen-space strand data from the current MASK
   var contours=[];    // each: {pts:[[sx,sy]..], nrm:[[nx,ny]..], cum:[..], total}
   function buildContours(){
-    var ms=marching(MASK,0.5);
+    blurToSmooth(MASKSMOOTH);
+    var ms=marching(SMOOTH,0.5);
     var lines=polylines(ms); if(!lines.length){ contours=[]; return; }
     lines.sort(function(a,b){return plen(b)-plen(a);});
-    var take=Math.min(2,lines.length), sx=W/(SW-1), sy=H/(SH-1), res=[];
+    var take=1, sx=W/(SW-1), sy=H/(SH-1), res=[];   // only the main subject -> no stray background loops
     for(var li=0; li<take; li++){
       var raw=lines[li]; if(plen(raw)<14) continue;
-      var sm=resample(chaikin(raw,2),1.1);
+      var sm=resample(chaikin(raw,3),1.1);
       var pts=[], nrm=[], cum=[0], total=0;
       for(var i=0;i<sm.length;i++){
         var a=sm[Math.max(0,i-1)], b=sm[Math.min(sm.length-1,i+1)];
@@ -178,7 +187,7 @@
       var m=Math.sqrt(gx*gx+gy*gy); TMP[o]=m; if(m>maxM)maxM=m;}
     for(var k=0;k<SW*SH;k++) RAW[k]=(TMP[k]/maxM)>0.18?1:0;
     morph(RAW,TMP,7,true); morph(RAW,TMP,7,false);
-    for(var e=0;e<SW*SH;e++) MASK[e]=MASK[e]*0.5+RAW[e]*0.5;
+    for(var e=0;e<SW*SH;e++) MASK[e]=MASK[e]*0.75+RAW[e]*0.25;
   }
   function morph(src,dst,r,isMax){var x,y,k,v,idx;
     for(y=0;y<SH;y++){var row=y*SW;for(x=0;x<SW;x++){v=isMax?-1:2;for(k=-r;k<=r;k++){idx=row+Math.max(0,Math.min(SW-1,x+k));var s=src[idx];if(isMax){if(s>v)v=s;}else{if(s<v)v=s;}}dst[row+x]=v;}}
@@ -190,7 +199,7 @@
     if(!res||!res.segmentationMask) return;
     try{ sctx.drawImage(res.segmentationMask,0,0,SW,SH); }catch(e){ return; }
     var d; try{ d=sctx.getImageData(0,0,SW,SH).data; }catch(e){ return; }
-    for(var i=0,p=0;i<SW*SH;i++,p+=4){ var v=d[p]/255; RAW[i]=v; MASK[i]=MASK[i]*0.6+v*0.4; }
+    for(var i=0,p=0;i<SW*SH;i++,p+=4){ var v=d[p]/255; RAW[i]=v; MASK[i]=MASK[i]*0.8+v*0.2; }
     var cov=maskCoverage();
     useSeg=(cov>0.015 && cov<0.85);   // trust seg only when it found a sensible-sized subject
   }
