@@ -55,7 +55,7 @@
       DOWNFORCE&nbsp;&nbsp;<b id="rDf">000</b> kg<br>
       UNDERBODY FLOW&nbsp;&nbsp;<b id="rFl">000</b> km/h
     </div>
-    <div id="hint">Point at the car · the air traces its shape</div>
+    <div id="hint">Point at the car · feel it charge the air</div>
   </div>
   <div id="gate">
     <div class="eyebrow">The Launch of Eletre X</div>
@@ -65,7 +65,7 @@
       </svg>
     </div>
     <h1>Ground<br><span class="yl">Effect</span></h1>
-    <div class="sub">The Type 79 won by moving the air beneath it. Point your phone at the car and watch the air trace its shape.</div>
+    <div class="sub">The Type 79 won by moving the air beneath it. Point your phone at the car and watch it charge the air around it.</div>
     <button id="go">Begin</button>
     <div id="err"></div>
     <div class="foot">Turn up brightness · Best in landscape</div>
@@ -80,100 +80,44 @@
   var W=0,H=0,DPR=Math.min(window.devicePixelRatio||1,2);
 
   var sc=document.createElement('canvas'), sctx=sc.getContext('2d',{willReadFrequently:true});
-  var SW=0,SH=0, MASK=null, RAW=null, TMP=null, SMOOTH=null;
-  var useSeg=false;                                  // becomes true once segmentation gives a good mask
+  var aura=document.createElement('canvas'), actx=null, auraImg=null;
+  var SW=0,SH=0, MASK=null, RAW=null, F1=null, F2=null, T1=null, T2=null;
+  var useSeg=false;
 
-  // ---- tunables ----
-  var STRANDS=5;        // ribbons in the bundle
-  var GAP=16;           // how far OUTSIDE the silhouette the bundle floats (px)
-  var SPACING=1.7;      // spacing between strands (px)
-  var BILLOW=6;         // how much the strands wave in/out (px)
-  var FLOWSPEED=1.7;    // speed of light travelling around the outline
-  var MASKSMOOTH=3;     // spatial smoothing of the silhouette (de-jitter + float around)
+  // ---- tunables (no crisp edge anywhere - pure soft blur) ----
+  var NARROW_R=8;       // inner blur of the soft ring
+  var WIDE_R=24;        // outer blur (bigger gap = softer, vaguer aura)
+  var INTENSITY=4.6;    // overall glow strength (DoG values are small)
+  var PULSE=0.20;       // how much it breathes
+  var WAVES=2.2;        // soft wave-rings rippling outward
+  var WSPEED=0.10;      // how fast the waves ripple out
 
   function resize(){
     W=window.innerWidth; H=window.innerHeight;
     canvas.width=W*DPR; canvas.height=H*DPR; canvas.style.width=W+'px'; canvas.style.height=H+'px';
     ctx.setTransform(DPR,0,0,DPR,0,0);
     SW=120; SH=Math.max(60,Math.round(SW*H/W)); sc.width=SW; sc.height=SH;
-    MASK=new Float32Array(SW*SH); RAW=new Float32Array(SW*SH); TMP=new Float32Array(SW*SH); SMOOTH=new Float32Array(SW*SH);
+    aura.width=SW; aura.height=SH; actx=aura.getContext('2d'); auraImg=actx.createImageData(SW,SH);
+    MASK=new Float32Array(SW*SH); RAW=new Float32Array(SW*SH);
+    F1=new Float32Array(SW*SH); F2=new Float32Array(SW*SH); T1=new Float32Array(SW*SH); T2=new Float32Array(SW*SH);
   }
   window.addEventListener('resize',resize); resize();
 
-  // ================= contour geometry (validated in node) =================
-  function edgePoint(kind,x,y,S,iso){ if(kind==='H'){var a=S[y*SW+x],b=S[y*SW+x+1];return [x+(iso-a)/((b-a)||1e-6),y];} var c=S[y*SW+x],d=S[(y+1)*SW+x];return [x,y+(iso-c)/((d-c)||1e-6)]; }
-  function marching(S,iso){
-    var points={},adj={};
-    function E(k,x,y){var id=k+x+'_'+y; if(!(id in points))points[id]=edgePoint(k,x,y,S,iso); return id;}
-    function link(a,b){(adj[a]||(adj[a]=[])).push(b);(adj[b]||(adj[b]=[])).push(a);}
-    for(var y=0;y<SH-1;y++)for(var x=0;x<SW-1;x++){
-      var tl=S[y*SW+x]>=iso,tr=S[y*SW+x+1]>=iso,br=S[(y+1)*SW+x+1]>=iso,bl=S[(y+1)*SW+x]>=iso;
-      var c=(tl?1:0)|(tr?2:0)|(br?4:0)|(bl?8:0); if(c===0||c===15)continue;
-      var T=E('H',x,y),R=E('V',x+1,y),B=E('H',x,y+1),L=E('V',x,y);
-      switch(c){case 1:link(L,T);break;case 2:link(T,R);break;case 3:link(L,R);break;case 4:link(R,B);break;
-        case 5:link(L,T);link(R,B);break;case 6:link(T,B);break;case 7:link(L,B);break;case 8:link(B,L);break;
-        case 9:link(T,B);break;case 10:link(T,R);link(B,L);break;case 11:link(R,B);break;case 12:link(R,L);break;
-        case 13:link(T,R);break;case 14:link(T,L);break;}
-    }
-    return {points:points,adj:adj};
-  }
-  function polylines(ms){
-    var points=ms.points,adj=ms.adj,used={},lines=[];
-    function walk(start){var line=[start],prev=null,cur=start;
-      for(;;){var ns=adj[cur]||[],nxt=null,i;
-        for(i=0;i<ns.length;i++){var e=cur+'|'+ns[i];if(!used[e]&&ns[i]!==prev){nxt=ns[i];used[e]=used[ns[i]+'|'+cur]=1;break;}}
-        if(nxt===null)for(i=0;i<ns.length;i++){var f=cur+'|'+ns[i];if(!used[f]){nxt=ns[i];used[f]=used[ns[i]+'|'+cur]=1;break;}}
-        if(nxt===null)break; line.push(nxt);prev=cur;cur=nxt; if(cur===start)break;}
-      return line;}
-    var ids=Object.keys(adj); ids.sort(function(a,b){return adj[a].length-adj[b].length;});
-    for(var k=0;k<ids.length;k++){var id=ids[k],any=false,ns=adj[id],m;
-      for(m=0;m<ns.length;m++){if(!used[id+'|'+ns[m]]){any=true;break;}} if(!any)continue;
-      var poly=walk(id).map(function(p){return points[p];}); if(poly.length>=8)lines.push(poly);}
-    return lines;
-  }
-  function plen(p){var L=0;for(var i=1;i<p.length;i++)L+=Math.hypot(p[i][0]-p[i-1][0],p[i][1]-p[i-1][1]);return L;}
-  function chaikin(p,n){for(var s=0;s<n;s++){var o=[p[0]];for(var i=0;i<p.length-1;i++){var a=p[i],b=p[i+1];o.push([a[0]*.75+b[0]*.25,a[1]*.75+b[1]*.25]);o.push([a[0]*.25+b[0]*.75,a[1]*.25+b[1]*.75]);}o.push(p[p.length-1]);p=o;}return p;}
-  function resample(p,step){if(p.length<2)return p;var o=[p[0]],acc=0,i=1,cx=p[0][0],cy=p[0][1];while(i<p.length){var nx=p[i][0],ny=p[i][1],d=Math.hypot(nx-cx,ny-cy);if(acc+d>=step){var t=(step-acc)/((d)||1e-6);var px=cx+(nx-cx)*t,py=cy+(ny-cy)*t;o.push([px,py]);cx=px;cy=py;acc=0;}else{acc+=d;cx=nx;cy=ny;i++;}}return o;}
-  function maskAt(px,py){var xi=Math.round(px),yi=Math.round(py);if(xi<0||yi<0||xi>=SW||yi>=SH)return 0;return SMOOTH[yi*SW+xi];}
-  function blurToSmooth(r){ // box-blur MASK -> SMOOTH (keeps MASK intact); softens + de-jitters the outline
+  // box blur: src -> dst (via tmp), radius r
+  function blur(src,dst,tmp,r){
     var x,y,k,acc;
-    for(y=0;y<SH;y++){var row=y*SW;acc=0;for(k=-r;k<=r;k++)acc+=MASK[row+Math.max(0,Math.min(SW-1,k))];
-      for(x=0;x<SW;x++){TMP[row+x]=acc/(2*r+1);acc+=MASK[row+Math.min(SW-1,x+r+1)]-MASK[row+Math.max(0,x-r)];}}
-    for(x=0;x<SW;x++){acc=0;for(k=-r;k<=r;k++)acc+=TMP[Math.max(0,Math.min(SH-1,k))*SW+x];
-      for(y=0;y<SH;y++){SMOOTH[y*SW+x]=acc/(2*r+1);acc+=TMP[Math.min(SH-1,y+r+1)*SW+x]-TMP[Math.max(0,y-r)*SW+x];}}
+    for(y=0;y<SH;y++){var row=y*SW;acc=0;for(k=-r;k<=r;k++)acc+=src[row+Math.max(0,Math.min(SW-1,k))];
+      for(x=0;x<SW;x++){tmp[row+x]=acc/(2*r+1);acc+=src[row+Math.min(SW-1,x+r+1)]-src[row+Math.max(0,x-r)];}}
+    for(x=0;x<SW;x++){acc=0;for(k=-r;k<=r;k++)acc+=tmp[Math.max(0,Math.min(SH-1,k))*SW+x];
+      for(y=0;y<SH;y++){dst[y*SW+x]=acc/(2*r+1);acc+=tmp[Math.min(SH-1,y+r+1)*SW+x]-tmp[Math.max(0,y-r)*SW+x];}}
   }
+  function morph(src,dst,r,isMax){var x,y,k,v,idx;
+    for(y=0;y<SH;y++){var row=y*SW;for(x=0;x<SW;x++){v=isMax?-1:2;for(k=-r;k<=r;k++){idx=row+Math.max(0,Math.min(SW-1,x+k));var s=src[idx];if(isMax){if(s>v)v=s;}else{if(s<v)v=s;}}dst[row+x]=v;}}
+    for(x=0;x<SW;x++){for(y=0;y<SH;y++){v=isMax?-1:2;for(k=-r;k<=r;k++){idx=Math.max(0,Math.min(SH-1,y+k))*SW+x;var s2=dst[idx];if(isMax){if(s2>v)v=s2;}else{if(s2<v)v=s2;}}src[y*SW+x]=v;}}}
 
-  // build screen-space strand data from the current MASK
-  var contours=[];    // each: {pts:[[sx,sy]..], nrm:[[nx,ny]..], cum:[..], total}
-  function buildContours(){
-    blurToSmooth(MASKSMOOTH);
-    var ms=marching(SMOOTH,0.5);
-    var lines=polylines(ms); if(!lines.length){ contours=[]; return; }
-    lines.sort(function(a,b){return plen(b)-plen(a);});
-    var take=1, sx=W/(SW-1), sy=H/(SH-1), res=[];   // only the main subject -> no stray background loops
-    for(var li=0; li<take; li++){
-      var raw=lines[li]; if(plen(raw)<14) continue;
-      var sm=resample(chaikin(raw,3),1.1);
-      var pts=[], nrm=[], cum=[0], total=0;
-      for(var i=0;i<sm.length;i++){
-        var a=sm[Math.max(0,i-1)], b=sm[Math.min(sm.length-1,i+1)];
-        var tx=b[0]-a[0], ty=b[1]-a[1]; var tl=Math.hypot(tx,ty)||1; tx/=tl; ty/=tl;
-        var nx=-ty, ny=tx, d=0.9;
-        var out=maskAt(sm[i][0]+nx*d,sm[i][1]+ny*d), inn=maskAt(sm[i][0]-nx*d,sm[i][1]-ny*d);
-        if(out>inn){ nx=-nx; ny=-ny; }                  // outward = toward background
-        var px=sm[i][0]*sx, py=sm[i][1]*sy;
-        pts.push([px,py]); nrm.push([nx,ny]);
-        if(i>0){ total+=Math.hypot(px-pts[i-1][0],py-pts[i-1][1]); cum.push(total); }
-      }
-      if(pts.length>10) res.push({pts:pts,nrm:nrm,cum:cum,total:total});
-    }
-    contours=res;
-  }
+  function maskCoverage(){var c=0;for(var i=0;i<SW*SH;i++)if(MASK[i]>0.5)c++;return c/(SW*SH);}
 
-  // ================= mask sources =================
-  function maskCoverage(){ var c=0; for(var i=0;i<SW*SH;i++) if(MASK[i]>0.5)c++; return c/(SW*SH); }
-
-  // heuristic fallback: sharp-edge fill -> solid mask
+  // heuristic fallback mask (for non-person objects: bag / car)
   function heuristicMask(){
     if(video.readyState<2) return;
     sctx.drawImage(video,0,0,SW,SH);
@@ -184,77 +128,57 @@
     for(var y=1;y<SH-1;y++)for(var x=1;x<SW-1;x++){var o=y*SW+x;
       var gx=(gray[o-SW+1]+2*gray[o+1]+gray[o+SW+1])-(gray[o-SW-1]+2*gray[o-1]+gray[o+SW-1]);
       var gy=(gray[o+SW-1]+2*gray[o+SW]+gray[o+SW+1])-(gray[o-SW-1]+2*gray[o-SW]+gray[o-SW+1]);
-      var m=Math.sqrt(gx*gx+gy*gy); TMP[o]=m; if(m>maxM)maxM=m;}
-    for(var k=0;k<SW*SH;k++) RAW[k]=(TMP[k]/maxM)>0.18?1:0;
-    morph(RAW,TMP,7,true); morph(RAW,TMP,7,false);
+      var m=Math.sqrt(gx*gx+gy*gy); T1[o]=m; if(m>maxM)maxM=m;}
+    for(var k=0;k<SW*SH;k++) RAW[k]=(T1[k]/maxM)>0.18?1:0;
+    morph(RAW,T2,7,true); morph(RAW,T2,7,false);
     for(var e=0;e<SW*SH;e++) MASK[e]=MASK[e]*0.75+RAW[e]*0.25;
   }
-  function morph(src,dst,r,isMax){var x,y,k,v,idx;
-    for(y=0;y<SH;y++){var row=y*SW;for(x=0;x<SW;x++){v=isMax?-1:2;for(k=-r;k<=r;k++){idx=row+Math.max(0,Math.min(SW-1,x+k));var s=src[idx];if(isMax){if(s>v)v=s;}else{if(s<v)v=s;}}dst[row+x]=v;}}
-    for(x=0;x<SW;x++){for(y=0;y<SH;y++){v=isMax?-1:2;for(k=-r;k<=r;k++){idx=Math.max(0,Math.min(SH-1,y+k))*SW+x;var s2=dst[idx];if(isMax){if(s2>v)v=s2;}else{if(s2<v)v=s2;}}src[y*SW+x]=v;}}}
 
-  // MediaPipe selfie segmentation -> soft mask, temporally smoothed
+  // MediaPipe selfie segmentation
   var seg=null;
   function onSeg(res){
     if(!res||!res.segmentationMask) return;
     try{ sctx.drawImage(res.segmentationMask,0,0,SW,SH); }catch(e){ return; }
     var d; try{ d=sctx.getImageData(0,0,SW,SH).data; }catch(e){ return; }
-    for(var i=0,p=0;i<SW*SH;i++,p+=4){ var v=d[p]/255; RAW[i]=v; MASK[i]=MASK[i]*0.8+v*0.2; }
-    var cov=maskCoverage();
-    useSeg=(cov>0.015 && cov<0.85);   // trust seg only when it found a sensible-sized subject
+    for(var i=0,p=0;i<SW*SH;i++,p+=4){ var v=d[p]/255; MASK[i]=MASK[i]*0.72+v*0.28; }
+    var cov=maskCoverage(); useSeg=(cov>0.015 && cov<0.9);
   }
   async function segTick(){
     if(!running) return;
     if(seg && video.readyState>=2 && !document.hidden){ try{ await seg.send({image:video}); }catch(e){} }
-    setTimeout(segTick, 70);
+    setTimeout(segTick, 66);
   }
 
-  // ================= render =================
-  var running=false,t=0,fieldTick=0;
+  var running=false,t=0;
   var dfEl=document.getElementById('rDf'),flEl=document.getElementById('rFl');
   var dfShown=0,flShown=0;
-
-  function drawStrand(c, off, phase, aMul){
-    var pts=c.pts,nrm=c.nrm,cum=c.cum, n=pts.length;
-    ctx.beginPath();
-    for(var i=0;i<n;i++){
-      var billow=Math.sin(cum[i]*0.045 + phase)*BILLOW*0.5 + Math.sin(cum[i]*0.017 - phase*0.6)*BILLOW*0.5;
-      var o=off+billow;
-      var x=pts[i][0]+nrm[i][0]*o, y=pts[i][1]+nrm[i][1]*o;
-      if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);
-    }
-    ctx.stroke();
-  }
 
   function frame(){
     if(!running) return;
     t++;
-    if(useSeg){ if((fieldTick++ %3)===0) buildContours(); }
-    else { heuristicMask(); if((fieldTick++ %3)===0) buildContours(); }
+    if(!useSeg) heuristicMask();
+
+    // difference-of-blurs -> a soft ring of light with NO crisp edge on either side
+    blur(MASK,F1,T1,NARROW_R);
+    blur(MASK,F2,T2,WIDE_R);
+    var pulse = 1 + Math.sin(t*0.045)*PULSE + Math.sin(t*0.021+1.3)*PULSE*0.5;
+    var data=auraImg.data;
+    for(var i=0,p=0;i<SW*SH;i++,p+=4){
+      var band = F1[i]-F2[i]; if(band<0) band=0;      // both sides blurred -> soft, vague halo
+      // soft waves rippling outward (phase follows the outer blur = distance-ish)
+      var wv = 0.5 + 0.5*Math.sin(F2[i]*WAVES*6.2831 - t*WSPEED);
+      var glow = band * (0.5 + 0.5*wv) * INTENSITY * pulse;
+      if(glow>1) glow=1;
+      data[p]=255; data[p+1]=242; data[p+2]=0; data[p+3]=(glow*235)|0;   // pure soft yellow
+    }
+    actx.putImageData(auraImg,0,0);
 
     ctx.clearRect(0,0,W,H);
-    ctx.globalCompositeOperation='lighter'; ctx.lineCap='round'; ctx.lineJoin='round'; ctx.setLineDash([]);
+    ctx.globalCompositeOperation='lighter';
+    ctx.imageSmoothingEnabled=true; ctx.imageSmoothingQuality='high';
+    ctx.drawImage(aura,0,0,SW,SH,0,0,W,H);           // scale up -> buttery soft glow
 
-    for(var ci=0; ci<contours.length; ci++){
-      var c=contours[ci];
-      // 1) soft continuous glow for the whole bundle (no cuts)
-      for(var s=0;s<STRANDS;s++){
-        var off=GAP + s*SPACING;
-        var ph = t*0.03 + s*0.5;
-        ctx.strokeStyle='rgba(255,242,0,0.05)'; ctx.lineWidth=10; drawStrand(c,off,ph,1);
-        ctx.strokeStyle='rgba(255,244,120,0.5)'; ctx.lineWidth=1.4; drawStrand(c,off,ph,1);
-      }
-      // 2) light TRAVELLING around the outline (bright pulses over the continuous base)
-      ctx.setLineDash([16, Math.max(40,c.total*0.25)]);
-      ctx.lineDashOffset = -(t*FLOWSPEED) % 100000;
-      ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.lineWidth=2.0; drawStrand(c, GAP+2*SPACING, t*0.03+1.0, 1);
-      ctx.setLineDash([22, Math.max(60,c.total*0.3)]);
-      ctx.lineDashOffset = -(t*FLOWSPEED*0.8 + c.total*0.4) % 100000;
-      ctx.strokeStyle='rgba(255,255,220,0.6)'; ctx.lineWidth=1.4; drawStrand(c, GAP+4*SPACING, t*0.03+2.0, 1);
-      ctx.setLineDash([]);
-    }
-
-    var targetDf=380+Math.round(Math.sin(t*0.03)*30+40);
+    var targetDf=380+Math.round(Math.sin(t*0.03)*30+40*pulse);
     var targetFl=210+Math.round(Math.cos(t*0.04)*20+30);
     dfShown+=(targetDf-dfShown)*0.08; flShown+=(targetFl-flShown)*0.08;
     dfEl.textContent=String(Math.round(dfShown)).padStart(3,'0');
@@ -264,24 +188,17 @@
 
   function showErr(m){ errEl.textContent=m; errEl.classList.add('on'); }
   async function begin(){
-    try{
-      if(typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function'){ await DeviceOrientationEvent.requestPermission(); }
-    }catch(e){}
+    try{ if(typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function'){ await DeviceOrientationEvent.requestPermission(); } }catch(e){}
     try{
       var stream=await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} }, audio:false });
       video.srcObject=stream; await video.play();
     }catch(e){ showErr('Camera blocked. Allow camera access, then reload. (HTTPS required.)'); return; }
-
-    // try to spin up segmentation; if the library isn't there, we silently use the heuristic
     try{
       if(typeof SelfieSegmentation!=='undefined'){
         seg=new SelfieSegmentation({locateFile:function(f){return 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/'+f;}});
-        seg.setOptions({modelSelection:1, selfieMode:false});
-        seg.onResults(onSeg);
-        segTick();
+        seg.setOptions({modelSelection:1, selfieMode:false}); seg.onResults(onSeg); segTick();
       }
     }catch(e){ seg=null; }
-
     gate.classList.add('hide'); hud.classList.add('on'); running=true; requestAnimationFrame(frame);
   }
   document.getElementById('go').addEventListener('click',begin);
