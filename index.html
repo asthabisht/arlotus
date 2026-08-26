@@ -12,7 +12,6 @@
   *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
   html,body{height:100%;background:var(--black);overflow:hidden;font-family:"Overpass",-apple-system,system-ui,sans-serif;color:var(--white)}
   #stage{position:fixed;inset:0;overflow:hidden}
-
   #cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000;transform:scale(1.02)}
   #fx{position:absolute;inset:0;width:100%;height:100%}
 
@@ -58,7 +57,7 @@
       DOWNFORCE&nbsp;&nbsp;<b id="rDf">000</b> kg<br>
       UNDERBODY FLOW&nbsp;&nbsp;<b id="rFl">000</b> km/h
     </div>
-    <div id="hint">Sweep across the objects in front of you</div>
+    <div id="hint">Point at the car · watch the air flow over it</div>
   </div>
 
   <div id="gate">
@@ -69,7 +68,7 @@
       </svg>
     </div>
     <h1>Ground<br><span class="yl">Effect</span></h1>
-    <div class="sub">The Type 79 won by moving the air beneath it. Point your phone at the car and watch the air find its edges.</div>
+    <div class="sub">The Type 79 won by moving the air beneath it. Point your phone at the car and watch the air flow over it.</div>
     <button id="go">Begin</button>
     <div id="err"></div>
     <div class="foot">Turn up brightness · Best in landscape</div>
@@ -87,175 +86,140 @@
   var errEl=document.getElementById('err');
   var W=0,H=0,DPR=Math.min(window.devicePixelRatio||1,2);
 
-  // low-res sampling buffer for edge detection
+  // low-res sampling buffer
   var sc=document.createElement('canvas');
   var sctx=sc.getContext('2d',{willReadFrequently:true});
-  var SW=0,SH=0;             // sample grid dims
-  var MAG=null;             // edge magnitude field (0..1)
-  var GX=null, GY=null;     // gradient direction
-  var EDGES=[];             // list of [screenX,screenY] on strong edges (spawn points)
+  var SW=0,SH=0;
+  var OB=null, TMP=null, OGX=null, OGY=null;   // obstacle field + blur temp + gradient
+
+  // ---- tunables ----
+  var LINES=26;         // number of streamlines
+  var STEPS=110;        // integration steps across the frame
+  var BEND=1.15;        // how hard the air bends around objects  (sensitivity to shape)
+  var SENS=2.6;         // obstacle sensitivity (higher = reacts to softer edges)
+  var BLUR=3;           // obstacle blur radius (broader = smoother wrap)
 
   function resize(){
     W=window.innerWidth; H=window.innerHeight;
     canvas.width=W*DPR; canvas.height=H*DPR;
     canvas.style.width=W+'px'; canvas.style.height=H+'px';
     ctx.setTransform(DPR,0,0,DPR,0,0);
-    SW=140; SH=Math.max(40,Math.round(SW*H/W));
+    SW=160; SH=Math.max(50,Math.round(SW*H/W));
     sc.width=SW; sc.height=SH;
-    MAG=new Float32Array(SW*SH);
-    GX=new Float32Array(SW*SH);
-    GY=new Float32Array(SW*SH);
+    OB=new Float32Array(SW*SH); TMP=new Float32Array(SW*SH);
+    OGX=new Float32Array(SW*SH); OGY=new Float32Array(SW*SH);
   }
   window.addEventListener('resize',resize); resize();
 
-  // ---- device tilt -> subtle parallax on the flow ----
   var tiltX=0,tiltY=0,tTiltX=0,tTiltY=0;
   function onOrient(e){
     if(e.gamma!=null) tTiltX=Math.max(-1,Math.min(1,e.gamma/45));
     if(e.beta!=null)  tTiltY=Math.max(-1,Math.min(1,(e.beta-45)/45));
   }
 
-  // ---- edge detection (Sobel on luminance) ----
-  function computeEdges(){
+  function boxBlur(src,dst,r){
+    // horizontal
+    for(var y=0;y<SH;y++){
+      var row=y*SW, acc=0;
+      for(var x=-r;x<=r;x++) acc+=src[row+Math.max(0,Math.min(SW-1,x))];
+      for(var x2=0;x2<SW;x2++){
+        dst[row+x2]=acc/(2*r+1);
+        var add=src[row+Math.min(SW-1,x2+r+1)], sub=src[row+Math.max(0,x2-r)];
+        acc+=add-sub;
+      }
+    }
+    // vertical (dst->src reuse via TMP swap handled by caller)
+    for(var x3=0;x3<SW;x3++){
+      var acc2=0;
+      for(var y3=-r;y3<=r;y3++) acc2+=dst[Math.max(0,Math.min(SH-1,y3))*SW+x3];
+      for(var y4=0;y4<SH;y4++){
+        src[y4*SW+x3]=acc2/(2*r+1);
+        var add2=dst[Math.min(SH-1,y4+r+1)*SW+x3], sub2=dst[Math.max(0,y4-r)*SW+x3];
+        acc2+=add2-sub2;
+      }
+    }
+  }
+
+  function computeField(){
     if(video.readyState<2) return;
     sctx.drawImage(video,0,0,SW,SH);
     var img;
     try{ img=sctx.getImageData(0,0,SW,SH).data; }catch(e){ return; }
-    // grayscale
-    var gray=computeEdges._g||(computeEdges._g=new Float32Array(SW*SH));
-    for(var i=0,p=0;i<SW*SH;i++,p+=4){
-      gray[i]=(img[p]*0.299+img[p+1]*0.587+img[p+2]*0.114)/255;
-    }
+    // obstacle = edge energy (Sobel on luminance) -> where "stuff" is
+    var gray=computeField._g||(computeField._g=new Float32Array(SW*SH));
+    for(var i=0,p=0;i<SW*SH;i++,p+=4) gray[i]=(img[p]*0.299+img[p+1]*0.587+img[p+2]*0.114)/255;
     var maxM=0.0001;
-    for(var y=1;y<SH-1;y++){
-      for(var x=1;x<SW-1;x++){
-        var o=y*SW+x;
-        var tl=gray[o-SW-1],tc=gray[o-SW],tr=gray[o-SW+1];
-        var ml=gray[o-1],       mr=gray[o+1];
-        var bl=gray[o+SW-1],bc=gray[o+SW],br=gray[o+SW+1];
-        var gx=(tr+2*mr+br)-(tl+2*ml+bl);
-        var gy=(bl+2*bc+br)-(tl+2*tc+tr);
-        var m=Math.sqrt(gx*gx+gy*gy);
-        MAG[o]=m; GX[o]=gx; GY[o]=gy;
-        if(m>maxM)maxM=m;
-      }
+    for(var y=1;y<SH-1;y++)for(var x=1;x<SW-1;x++){
+      var o=y*SW+x;
+      var gx=(gray[o-SW+1]+2*gray[o+1]+gray[o+SW+1])-(gray[o-SW-1]+2*gray[o-1]+gray[o+SW-1]);
+      var gy=(gray[o+SW-1]+2*gray[o+SW]+gray[o+SW+1])-(gray[o-SW-1]+2*gray[o-SW]+gray[o-SW+1]);
+      var m=Math.sqrt(gx*gx+gy*gy); OB[o]=m; if(m>maxM)maxM=m;
     }
-    // normalise + collect strong-edge spawn points
-    EDGES.length=0;
-    for(var k=0;k<SW*SH;k++){
-      MAG[k]=MAG[k]/maxM;
-      if(MAG[k]>0.22){
-        var ex=(k%SW), ey=(k/SW)|0;
-        EDGES.push(ex/SW*W, ey/SH*H);
-      }
+    for(var k=0;k<SW*SH;k++) OB[k]=Math.min(1,(OB[k]/maxM)*SENS);
+    // broaden into a smooth obstacle cloud the air can wrap around
+    boxBlur(OB,TMP,BLUR); boxBlur(OB,TMP,BLUR);
+    // gradient of the obstacle field
+    for(var y2=1;y2<SH-1;y2++)for(var x2=1;x2<SW-1;x2++){
+      var oo=y2*SW+x2;
+      OGX[oo]=(OB[oo+1]-OB[oo-1])*0.5;
+      OGY[oo]=(OB[oo+SW]-OB[oo-SW])*0.5;
     }
   }
-  function sampleGrad(px,py){
+  function gradAt(px,py,out){
     var x=px/W*SW|0, y=py/H*SH|0;
-    if(x<0||y<0||x>=SW||y>=SH) return null;
-    var o=y*SW+x; return [GX[o],GY[o]];
-  }
-  function respawnOnEdge(pt){
-    if(EDGES.length>=2){
-      var i=(Math.random()*(EDGES.length/2))|0;
-      pt.x=EDGES[i*2]+(Math.random()-0.5)*6;
-      pt.y=EDGES[i*2+1]+(Math.random()-0.5)*6;
-    }else{
-      pt.x=-50; pt.y=-50;   // no edges in view -> park offscreen
-    }
-    pt.vx=(Math.random()-0.5); pt.vy=(Math.random()-0.5);
-    pt.hist.length=0; pt.age=0; pt.max=160+Math.random()*220;
-  }
-  function sampleMag(px,py){
-    var x=px/W*SW, y=py/H*SH;
-    var xi=x|0, yi=y|0;
-    if(xi<0||yi<0||xi>=SW||yi>=SH) return 0;
-    return MAG[yi*SW+xi];
+    if(x<1||y<1||x>=SW-1||y>=SH-1){ out[0]=0; out[1]=0; return; }
+    var o=y*SW+x; out[0]=OGX[o]; out[1]=OGY[o];
   }
 
-  // ---- edge-riding flow particles ----
-  var P=[], N=110, TRAIL=16, SPEED=1.7, TH_ON=0.11;
-  function seed(){
-    P.length=0;
-    for(var i=0;i<N;i++){ var pt={x:-50,y:-50,vx:0,vy:0,hist:[],age:0,max:200}; P.push(pt); }
-  }
-
-  var running=false,t=0,edgeTick=0;
+  var running=false,t=0,fieldTick=0;
   var dfEl=document.getElementById('rDf'),flEl=document.getElementById('rFl');
   var dfShown=0,flShown=0;
+  var g=[0,0];
 
   function frame(){
     if(!running) return;
     t++;
     tiltX+=(tTiltX-tiltX)*0.06; tiltY+=(tTiltY-tiltY)*0.06;
+    if((fieldTick++ %2)===0) computeField();
 
-    // refresh edges a few times a second (cheap)
-    if((edgeTick++ %3)===0) computeEdges();
-
-    // FULLY transparent clear -> camera always shows through, empty space stays clean
-    ctx.clearRect(0,0,W,H);
+    ctx.clearRect(0,0,W,H);           // camera always visible
     ctx.globalCompositeOperation='lighter';
-
-    // ---- flow that RIDES the object edges, dissipates in open space ----
-    var trail=new Path2D(), core=new Path2D();
-    for(var i=0;i<P.length;i++){
-      var pt=P[i];
-      var m=sampleMag(pt.x,pt.y);
-
-      if(m>TH_ON){
-        // on an edge: flow ALONG the contour (perpendicular to the gradient)
-        var g=sampleGrad(pt.x,pt.y);
-        if(g){
-          var gl=Math.hypot(g[0],g[1])||1;
-          var nx=g[0]/gl, ny=g[1]/gl;      // across the edge
-          var tx=-ny, ty=nx;               // along the edge
-          if(pt.vx*tx+pt.vy*ty<0){ tx=-tx; ty=-ty; }   // keep one direction
-          // stick to the ridge: steer toward higher edge energy
-          var d=3;
-          var corr=sampleMag(pt.x+nx*d,pt.y+ny*d)-sampleMag(pt.x-nx*d,pt.y-ny*d);
-          var cvx=tx*SPEED+nx*corr*2.4;
-          var cvy=ty*SPEED+ny*corr*2.4;
-          pt.vx+=(cvx-pt.vx)*0.35; pt.vy+=(cvy-pt.vy)*0.35;
-        }
-        pt.x+=pt.vx; pt.y+=pt.vy;
-        pt.hist.push(pt.x,pt.y);
-        if(pt.hist.length>TRAIL*2) pt.hist.splice(0,2);
-        pt.age++;
-      } else {
-        // drifted off the edge: flow onward but dissipate from the tail
-        pt.x+=pt.vx*0.7; pt.y+=pt.vy*0.7;
-        pt.hist.push(pt.x,pt.y);   // +2
-        pt.hist.splice(0,4);       // -4 net -> trail shrinks as it drifts off
-      }
-
-      if(pt.hist.length===0 || pt.age>pt.max ||
-         pt.x<-30||pt.x>W+30||pt.y<-30||pt.y>H+30){
-        respawnOnEdge(pt);
-        continue;
-      }
-
-      var h=pt.hist;
-      if(h.length>=4){
-        trail.moveTo(h[0],h[1]);
-        for(var j=2;j<h.length;j+=2) trail.lineTo(h[j],h[j+1]);
-        var st=Math.max(0,h.length-6);
-        core.moveTo(h[st],h[st+1]);
-        for(var k=st+2;k<h.length;k+=2) core.lineTo(h[k],h[k+1]);
-      }
-    }
-    // electric styling: wide yellow bloom, warm mid, white-hot core
     ctx.lineCap='round'; ctx.lineJoin='round';
-    ctx.strokeStyle='rgba(255,242,0,0.20)'; ctx.lineWidth=6; ctx.stroke(trail);
-    ctx.strokeStyle='rgba(255,238,110,0.55)'; ctx.lineWidth=2.4; ctx.stroke(trail);
-    ctx.strokeStyle='rgba(255,255,255,0.95)'; ctx.lineWidth=1; ctx.stroke(core);
-    // spark heads
-    ctx.fillStyle='rgba(255,255,255,0.9)';
-    for(var s2=0;s2<P.length;s2++){
-      var pp=P[s2];
-      if(pp.hist.length>0 && pp.x>0&&pp.x<W&&pp.y>0&&pp.y<H) ctx.fillRect(pp.x-1,pp.y-1,2.2,2.2);
+
+    var stepLen=W/STEPS;
+    var glow=new Path2D(), base=new Path2D();
+
+    for(var li=0; li<LINES; li++){
+      // evenly spaced inlet, gently breathing
+      var y0 = (li+0.5)/LINES*H + Math.sin(t*0.012 + li*0.7)*4 + tiltY*20;
+      var x=-stepLen*4, y=y0;
+      glow.moveTo(x,y); base.moveTo(x,y);
+      for(var s=0; s<STEPS+6; s++){
+        gradAt(x,y,g);
+        // bend AWAY from the obstacle cloud: rise over the top, dip under the base
+        var delta = -(g[1])*BEND*14;              // vertical bend from shape
+        var dhx   = -(g[0])*BEND*6;               // slight along-flow compression
+        if(delta>1.0)delta=1.0; if(delta<-1.0)delta=-1.0;
+        var dirx=Math.cos(delta)+dhx, diry=Math.sin(delta);
+        var dl=Math.hypot(dirx,diry)||1;
+        x+=dirx/dl*stepLen; y+=diry/dl*stepLen;
+        glow.lineTo(x,y); base.lineTo(x,y);
+        if(x>W+stepLen*4) break;
+      }
     }
 
-    // ---- readout ----
+    // wind-tunnel styling: continuous soft glowing streamlines, NO breaks
+    ctx.setLineDash([]);
+    ctx.strokeStyle='rgba(255,242,0,0.08)'; ctx.lineWidth=12; ctx.stroke(glow);  // wide soft haze
+    ctx.strokeStyle='rgba(255,242,0,0.16)'; ctx.lineWidth=6;  ctx.stroke(glow);  // bloom
+    ctx.strokeStyle='rgba(255,244,90,0.55)'; ctx.lineWidth=2.4; ctx.stroke(base); // body of the line
+    ctx.strokeStyle='rgba(255,252,210,0.9)'; ctx.lineWidth=1;  ctx.stroke(base); // bright continuous core
+    // faint travelling shimmer (kept subtle so the line still reads unbroken)
+    ctx.strokeStyle='rgba(255,255,255,0.28)'; ctx.lineWidth=1.4;
+    ctx.setLineDash([26,150]); ctx.lineDashOffset = -(t*2.4)%176;
+    ctx.stroke(base);
+    ctx.setLineDash([]);
+
     var targetDf=380+Math.round(Math.abs(tiltY)*260+Math.sin(t*0.03)*18);
     var targetFl=210+Math.round(Math.abs(tiltX)*120+Math.cos(t*0.04)*10);
     dfShown+=(targetDf-dfShown)*0.08; flShown+=(targetFl-flShown)*0.08;
@@ -274,25 +238,15 @@
         if(s==='granted') window.addEventListener('deviceorientation',onOrient,true);
       } else { window.addEventListener('deviceorientation',onOrient,true); }
     }catch(e){}
-
     try{
       var stream=await navigator.mediaDevices.getUserMedia({
         video:{ facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} }, audio:false
       });
-      video.srcObject=stream;
-      await video.play();
-    }catch(e){
-      showErr('Camera blocked. Allow camera access, then reload. (HTTPS required.)');
-      return;
-    }
-
-    seed();
-    gate.classList.add('hide');
-    hud.classList.add('on');
-    running=true;
-    requestAnimationFrame(frame);
+      video.srcObject=stream; await video.play();
+    }catch(e){ showErr('Camera blocked. Allow camera access, then reload. (HTTPS required.)'); return; }
+    gate.classList.add('hide'); hud.classList.add('on');
+    running=true; requestAnimationFrame(frame);
   }
-
   document.getElementById('go').addEventListener('click',begin);
 })();
 </script>
