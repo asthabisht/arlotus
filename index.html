@@ -93,6 +93,7 @@
   var SW=0,SH=0;             // sample grid dims
   var MAG=null;             // edge magnitude field (0..1)
   var GX=null, GY=null;     // gradient direction
+  var EDGES=[];             // list of [screenX,screenY] on strong edges (spawn points)
 
   function resize(){
     W=window.innerWidth; H=window.innerHeight;
@@ -139,8 +140,31 @@
         if(m>maxM)maxM=m;
       }
     }
-    // normalise
-    for(var k=0;k<SW*SH;k++) MAG[k]=MAG[k]/maxM;
+    // normalise + collect strong-edge spawn points
+    EDGES.length=0;
+    for(var k=0;k<SW*SH;k++){
+      MAG[k]=MAG[k]/maxM;
+      if(MAG[k]>0.22){
+        var ex=(k%SW), ey=(k/SW)|0;
+        EDGES.push(ex/SW*W, ey/SH*H);
+      }
+    }
+  }
+  function sampleGrad(px,py){
+    var x=px/W*SW|0, y=py/H*SH|0;
+    if(x<0||y<0||x>=SW||y>=SH) return null;
+    var o=y*SW+x; return [GX[o],GY[o]];
+  }
+  function respawnOnEdge(pt){
+    if(EDGES.length>=2){
+      var i=(Math.random()*(EDGES.length/2))|0;
+      pt.x=EDGES[i*2]+(Math.random()-0.5)*6;
+      pt.y=EDGES[i*2+1]+(Math.random()-0.5)*6;
+    }else{
+      pt.x=-50; pt.y=-50;   // no edges in view -> park offscreen
+    }
+    pt.vx=(Math.random()-0.5); pt.vy=(Math.random()-0.5);
+    pt.hist.length=0; pt.age=0; pt.max=160+Math.random()*220;
   }
   function sampleMag(px,py){
     var x=px/W*SW, y=py/H*SH;
@@ -149,21 +173,11 @@
     return MAG[yi*SW+xi];
   }
 
-  // ---- flow particles ----
-  var P=[], N=130, TRAIL=9;
+  // ---- edge-riding flow particles ----
+  var P=[], N=110, TRAIL=16, SPEED=1.7, TH_ON=0.11;
   function seed(){
     P.length=0;
-    for(var i=0;i<N;i++) P.push(newP(Math.random()*W));
-  }
-  function newP(startX){
-    var y=Math.random()*H;
-    return {
-      x:startX, y:y,
-      vx:0.9+Math.random()*1.4, vy:(Math.random()-0.5)*0.3,
-      w:0.6+Math.random()*1.1,
-      hist:[],
-      life:0, max:220+Math.random()*260
-    };
+    for(var i=0;i<N;i++){ var pt={x:-50,y:-50,vx:0,vy:0,hist:[],age:0,max:200}; P.push(pt); }
   }
 
   var running=false,t=0,edgeTick=0;
@@ -178,83 +192,67 @@
     // refresh edges a few times a second (cheap)
     if((edgeTick++ %3)===0) computeEdges();
 
-    // FULLY transparent clear -> camera always shows through
+    // FULLY transparent clear -> camera always shows through, empty space stays clean
     ctx.clearRect(0,0,W,H);
     ctx.globalCompositeOperation='lighter';
 
-    // ---- 1) trace electric outlines on the real-world edges ----
-    var edgePath=new Path2D();
-    var step=2, TH=0.16;
-    for(var y=1;y<SH-1;y+=step){
-      for(var x=1;x<SW-1;x+=step){
-        var o=y*SW+x, m=MAG[o];
-        if(m<TH) continue;
-        // draw a short segment ALONG the edge (perpendicular to gradient)
-        var gx=GX[o],gy=GY[o];
-        var len=Math.sqrt(gx*gx+gy*gy)||1;
-        var tx=-gy/len, ty=gx/len;               // tangent
-        var cx=x/SW*W, cy=y/SH*H;
-        var s=(3+m*6);
-        edgePath.moveTo(cx-tx*s, cy-ty*s);
-        edgePath.lineTo(cx+tx*s, cy+ty*s);
-      }
-    }
-    // glow pass + core pass
-    ctx.strokeStyle='rgba(255,242,0,0.16)'; ctx.lineWidth=4.5; ctx.lineCap='round'; ctx.stroke(edgePath);
-    ctx.strokeStyle='rgba(255,255,210,0.5)'; ctx.lineWidth=1.2; ctx.stroke(edgePath);
-
-    // ---- 2) airflow that weaves AROUND the objects ----
+    // ---- flow that RIDES the object edges, dissipates in open space ----
     var trail=new Path2D(), core=new Path2D();
-    var px=tiltX*10, py=tiltY*8;
     for(var i=0;i<P.length;i++){
       var pt=P[i];
-      // steer toward lower edge energy (go around cluttered / solid areas)
-      var ahead=14;
-      var nx=pt.x+pt.vx*ahead, ny=pt.y+pt.vy*ahead;
-      var mL=sampleMag(nx - pt.vy*ahead, ny + pt.vx*ahead); // left normal
-      var mR=sampleMag(nx + pt.vy*ahead, ny - pt.vx*ahead); // right normal
-      var mC=sampleMag(nx,ny);
-      var turn=(mL-mR)*0.9;                 // veer to the calmer side
-      // rotate velocity by turn
-      var cs=Math.cos(turn*0.12), sn=Math.sin(turn*0.12);
-      var vx=pt.vx*cs-pt.vy*sn, vy=pt.vx*sn+pt.vy*cs;
-      // slow down piling into an edge, speed up in open air (ground-effect squeeze)
-      var sp=1-mC*0.7;
-      vx*=(0.9+sp*0.25);
-      // gentle bias back toward horizontal flow + tiny electric jitter
-      vy=vy*0.96+(Math.random()-0.5)*0.06;
-      vx=vx*0.96+ (1.15)*0.04;
-      pt.vx=vx; pt.vy=vy;
-      pt.x+=vx; pt.y+=vy;
+      var m=sampleMag(pt.x,pt.y);
 
-      pt.hist.push(pt.x+px, pt.y+py);
-      if(pt.hist.length>TRAIL*2) pt.hist.splice(0,2);
+      if(m>TH_ON){
+        // on an edge: flow ALONG the contour (perpendicular to the gradient)
+        var g=sampleGrad(pt.x,pt.y);
+        if(g){
+          var gl=Math.hypot(g[0],g[1])||1;
+          var nx=g[0]/gl, ny=g[1]/gl;      // across the edge
+          var tx=-ny, ty=nx;               // along the edge
+          if(pt.vx*tx+pt.vy*ty<0){ tx=-tx; ty=-ty; }   // keep one direction
+          // stick to the ridge: steer toward higher edge energy
+          var d=3;
+          var corr=sampleMag(pt.x+nx*d,pt.y+ny*d)-sampleMag(pt.x-nx*d,pt.y-ny*d);
+          var cvx=tx*SPEED+nx*corr*2.4;
+          var cvy=ty*SPEED+ny*corr*2.4;
+          pt.vx+=(cvx-pt.vx)*0.35; pt.vy+=(cvy-pt.vy)*0.35;
+        }
+        pt.x+=pt.vx; pt.y+=pt.vy;
+        pt.hist.push(pt.x,pt.y);
+        if(pt.hist.length>TRAIL*2) pt.hist.splice(0,2);
+        pt.age++;
+      } else {
+        // drifted off the edge: flow onward but dissipate from the tail
+        pt.x+=pt.vx*0.7; pt.y+=pt.vy*0.7;
+        pt.hist.push(pt.x,pt.y);   // +2
+        pt.hist.splice(0,4);       // -4 net -> trail shrinks as it drifts off
+      }
+
+      if(pt.hist.length===0 || pt.age>pt.max ||
+         pt.x<-30||pt.x>W+30||pt.y<-30||pt.y>H+30){
+        respawnOnEdge(pt);
+        continue;
+      }
 
       var h=pt.hist;
       if(h.length>=4){
         trail.moveTo(h[0],h[1]);
         for(var j=2;j<h.length;j+=2) trail.lineTo(h[j],h[j+1]);
-        // bright core = last 3 pts
         var st=Math.max(0,h.length-6);
         core.moveTo(h[st],h[st+1]);
         for(var k=st+2;k<h.length;k+=2) core.lineTo(h[k],h[k+1]);
       }
-
-      pt.life++;
-      if(pt.x>W+20 || pt.x<-20 || pt.y<-20 || pt.y>H+20 || pt.life>pt.max){
-        P[i]=newP(-10);
-      }
     }
-    // electric styling: wide yellow bloom, white-hot core, spark heads
-    ctx.strokeStyle='rgba(255,242,0,0.22)'; ctx.lineWidth=5; ctx.lineCap='round'; ctx.stroke(trail);
-    ctx.strokeStyle='rgba(255,240,120,0.55)'; ctx.lineWidth=2; ctx.stroke(trail);
-    ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.lineWidth=1; ctx.stroke(core);
-
+    // electric styling: wide yellow bloom, warm mid, white-hot core
+    ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.strokeStyle='rgba(255,242,0,0.20)'; ctx.lineWidth=6; ctx.stroke(trail);
+    ctx.strokeStyle='rgba(255,238,110,0.55)'; ctx.lineWidth=2.4; ctx.stroke(trail);
+    ctx.strokeStyle='rgba(255,255,255,0.95)'; ctx.lineWidth=1; ctx.stroke(core);
     // spark heads
     ctx.fillStyle='rgba(255,255,255,0.9)';
-    for(var s2=0;s2<P.length;s2+=1){
+    for(var s2=0;s2<P.length;s2++){
       var pp=P[s2];
-      ctx.fillRect(pp.x+px-1, pp.y+py-1, 2.2, 2.2);
+      if(pp.hist.length>0 && pp.x>0&&pp.x<W&&pp.y>0&&pp.y<H) ctx.fillRect(pp.x-1,pp.y-1,2.2,2.2);
     }
 
     // ---- readout ----
