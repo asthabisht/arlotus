@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Overpass:wght@400;600;800;900&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js" crossorigin="anonymous"></script>
 <style>
   :root{ --black:#0F0F0F; --yellow:#FFF200; --white:#ECECEC; }
   *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -54,7 +55,7 @@
       DOWNFORCE&nbsp;&nbsp;<b id="rDf">000</b> kg<br>
       UNDERBODY FLOW&nbsp;&nbsp;<b id="rFl">000</b> km/h
     </div>
-    <div id="hint">Point at the car · watch the air flow around it</div>
+    <div id="hint">Point at the car · the air traces its shape</div>
   </div>
   <div id="gate">
     <div class="eyebrow">The Launch of Eletre X</div>
@@ -64,7 +65,7 @@
       </svg>
     </div>
     <h1>Ground<br><span class="yl">Effect</span></h1>
-    <div class="sub">The Type 79 won by moving the air beneath it. Point your phone at the car and watch the air flow around it.</div>
+    <div class="sub">The Type 79 won by moving the air beneath it. Point your phone at the car and watch the air trace its shape.</div>
     <button id="go">Begin</button>
     <div id="err"></div>
     <div class="foot">Turn up brightness · Best in landscape</div>
@@ -79,147 +80,173 @@
   var W=0,H=0,DPR=Math.min(window.devicePixelRatio||1,2);
 
   var sc=document.createElement('canvas'), sctx=sc.getContext('2d',{willReadFrequently:true});
-  var SW=0,SH=0;
-  var SOLID=null, FL=null, TMP=null, OGX=null, OGY=null;   // solid mask, smooth occupancy, temp, gradient
+  var SW=0,SH=0, MASK=null, RAW=null, TMP=null;
+  var useSeg=false;                                  // becomes true once segmentation gives a good mask
 
   // ---- tunables ----
-  var N=80;             // streaks
-  var SPEED=2.3;        // flow speed
-  var SWIRL=1.7;        // how strongly it hugs / orbits the outline
-  var REPEL=3.0;        // how hard it refuses to enter the object
-  var EDGE_TH=0.17;     // sharpness needed to be "object"
-  var CLOSE=8;          // fill the object into a solid
-  var HALO=11;          // how far the flow field reaches around the object
+  var STRANDS=6;        // ribbons in the bundle
+  var GAP=3;            // how far outside the silhouette the bundle sits (px)
+  var SPACING=1.6;      // spacing between strands (px)
+  var BILLOW=9;         // how much the strands wave in/out (px)
+  var FLOWSPEED=2.2;    // speed of light travelling around the outline
 
   function resize(){
     W=window.innerWidth; H=window.innerHeight;
     canvas.width=W*DPR; canvas.height=H*DPR; canvas.style.width=W+'px'; canvas.style.height=H+'px';
     ctx.setTransform(DPR,0,0,DPR,0,0);
-    SW=150; SH=Math.max(50,Math.round(SW*H/W)); sc.width=SW; sc.height=SH;
-    SOLID=new Float32Array(SW*SH); FL=new Float32Array(SW*SH); TMP=new Float32Array(SW*SH);
-    OGX=new Float32Array(SW*SH); OGY=new Float32Array(SW*SH);
+    SW=120; SH=Math.max(60,Math.round(SW*H/W)); sc.width=SW; sc.height=SH;
+    MASK=new Float32Array(SW*SH); RAW=new Float32Array(SW*SH); TMP=new Float32Array(SW*SH);
   }
   window.addEventListener('resize',resize); resize();
 
-  var tiltY=0,tTiltY=0;
-  function onOrient(e){ if(e.beta!=null) tTiltY=Math.max(-1,Math.min(1,(e.beta-45)/45)); }
-
-  function morph(src,dst,r,isMax){
-    var x,y,k,v,idx;
-    for(y=0;y<SH;y++){ var row=y*SW;
-      for(x=0;x<SW;x++){ v=isMax?-1:2;
-        for(k=-r;k<=r;k++){ idx=row+Math.max(0,Math.min(SW-1,x+k)); var s=src[idx]; if(isMax){if(s>v)v=s;}else{if(s<v)v=s;} }
-        dst[row+x]=v; } }
-    for(x=0;x<SW;x++){ for(y=0;y<SH;y++){ v=isMax?-1:2;
-        for(k=-r;k<=r;k++){ idx=Math.max(0,Math.min(SH-1,y+k))*SW+x; var s2=dst[idx]; if(isMax){if(s2>v)v=s2;}else{if(s2<v)v=s2;} }
-        src[y*SW+x]=v; } }
+  // ================= contour geometry (validated in node) =================
+  function edgePoint(kind,x,y,S,iso){ if(kind==='H'){var a=S[y*SW+x],b=S[y*SW+x+1];return [x+(iso-a)/((b-a)||1e-6),y];} var c=S[y*SW+x],d=S[(y+1)*SW+x];return [x,y+(iso-c)/((d-c)||1e-6)]; }
+  function marching(S,iso){
+    var points={},adj={};
+    function E(k,x,y){var id=k+x+'_'+y; if(!(id in points))points[id]=edgePoint(k,x,y,S,iso); return id;}
+    function link(a,b){(adj[a]||(adj[a]=[])).push(b);(adj[b]||(adj[b]=[])).push(a);}
+    for(var y=0;y<SH-1;y++)for(var x=0;x<SW-1;x++){
+      var tl=S[y*SW+x]>=iso,tr=S[y*SW+x+1]>=iso,br=S[(y+1)*SW+x+1]>=iso,bl=S[(y+1)*SW+x]>=iso;
+      var c=(tl?1:0)|(tr?2:0)|(br?4:0)|(bl?8:0); if(c===0||c===15)continue;
+      var T=E('H',x,y),R=E('V',x+1,y),B=E('H',x,y+1),L=E('V',x,y);
+      switch(c){case 1:link(L,T);break;case 2:link(T,R);break;case 3:link(L,R);break;case 4:link(R,B);break;
+        case 5:link(L,T);link(R,B);break;case 6:link(T,B);break;case 7:link(L,B);break;case 8:link(B,L);break;
+        case 9:link(T,B);break;case 10:link(T,R);link(B,L);break;case 11:link(R,B);break;case 12:link(R,L);break;
+        case 13:link(T,R);break;case 14:link(T,L);break;}
+    }
+    return {points:points,adj:adj};
   }
-  function boxBlur(a,tmp,r){
-    var x,y,k,acc;
-    for(y=0;y<SH;y++){ var row=y*SW; acc=0;
-      for(k=-r;k<=r;k++) acc+=a[row+Math.max(0,Math.min(SW-1,k))];
-      for(x=0;x<SW;x++){ tmp[row+x]=acc/(2*r+1); acc+=a[row+Math.min(SW-1,x+r+1)]-a[row+Math.max(0,x-r)]; } }
-    for(x=0;x<SW;x++){ acc=0;
-      for(k=-r;k<=r;k++) acc+=tmp[Math.max(0,Math.min(SH-1,k))*SW+x];
-      for(y=0;y<SH;y++){ a[y*SW+x]=acc/(2*r+1); acc+=tmp[Math.min(SH-1,y+r+1)*SW+x]-tmp[Math.max(0,y-r)*SW+x]; } }
+  function polylines(ms){
+    var points=ms.points,adj=ms.adj,used={},lines=[];
+    function walk(start){var line=[start],prev=null,cur=start;
+      for(;;){var ns=adj[cur]||[],nxt=null,i;
+        for(i=0;i<ns.length;i++){var e=cur+'|'+ns[i];if(!used[e]&&ns[i]!==prev){nxt=ns[i];used[e]=used[ns[i]+'|'+cur]=1;break;}}
+        if(nxt===null)for(i=0;i<ns.length;i++){var f=cur+'|'+ns[i];if(!used[f]){nxt=ns[i];used[f]=used[ns[i]+'|'+cur]=1;break;}}
+        if(nxt===null)break; line.push(nxt);prev=cur;cur=nxt; if(cur===start)break;}
+      return line;}
+    var ids=Object.keys(adj); ids.sort(function(a,b){return adj[a].length-adj[b].length;});
+    for(var k=0;k<ids.length;k++){var id=ids[k],any=false,ns=adj[id],m;
+      for(m=0;m<ns.length;m++){if(!used[id+'|'+ns[m]]){any=true;break;}} if(!any)continue;
+      var poly=walk(id).map(function(p){return points[p];}); if(poly.length>=8)lines.push(poly);}
+    return lines;
+  }
+  function plen(p){var L=0;for(var i=1;i<p.length;i++)L+=Math.hypot(p[i][0]-p[i-1][0],p[i][1]-p[i-1][1]);return L;}
+  function chaikin(p,n){for(var s=0;s<n;s++){var o=[p[0]];for(var i=0;i<p.length-1;i++){var a=p[i],b=p[i+1];o.push([a[0]*.75+b[0]*.25,a[1]*.75+b[1]*.25]);o.push([a[0]*.25+b[0]*.75,a[1]*.25+b[1]*.75]);}o.push(p[p.length-1]);p=o;}return p;}
+  function resample(p,step){if(p.length<2)return p;var o=[p[0]],acc=0,i=1,cx=p[0][0],cy=p[0][1];while(i<p.length){var nx=p[i][0],ny=p[i][1],d=Math.hypot(nx-cx,ny-cy);if(acc+d>=step){var t=(step-acc)/((d)||1e-6);var px=cx+(nx-cx)*t,py=cy+(ny-cy)*t;o.push([px,py]);cx=px;cy=py;acc=0;}else{acc+=d;cx=nx;cy=ny;i++;}}return o;}
+  function maskAt(px,py){var xi=Math.round(px),yi=Math.round(py);if(xi<0||yi<0||xi>=SW||yi>=SH)return 0;return MASK[yi*SW+xi];}
+
+  // build screen-space strand data from the current MASK
+  var contours=[];    // each: {pts:[[sx,sy]..], nrm:[[nx,ny]..], cum:[..], total}
+  function buildContours(){
+    var ms=marching(MASK,0.5);
+    var lines=polylines(ms); if(!lines.length){ contours=[]; return; }
+    lines.sort(function(a,b){return plen(b)-plen(a);});
+    var take=Math.min(2,lines.length), sx=W/(SW-1), sy=H/(SH-1), res=[];
+    for(var li=0; li<take; li++){
+      var raw=lines[li]; if(plen(raw)<14) continue;
+      var sm=resample(chaikin(raw,2),1.1);
+      var pts=[], nrm=[], cum=[0], total=0;
+      for(var i=0;i<sm.length;i++){
+        var a=sm[Math.max(0,i-1)], b=sm[Math.min(sm.length-1,i+1)];
+        var tx=b[0]-a[0], ty=b[1]-a[1]; var tl=Math.hypot(tx,ty)||1; tx/=tl; ty/=tl;
+        var nx=-ty, ny=tx, d=0.9;
+        var out=maskAt(sm[i][0]+nx*d,sm[i][1]+ny*d), inn=maskAt(sm[i][0]-nx*d,sm[i][1]-ny*d);
+        if(out>inn){ nx=-nx; ny=-ny; }                  // outward = toward background
+        var px=sm[i][0]*sx, py=sm[i][1]*sy;
+        pts.push([px,py]); nrm.push([nx,ny]);
+        if(i>0){ total+=Math.hypot(px-pts[i-1][0],py-pts[i-1][1]); cum.push(total); }
+      }
+      if(pts.length>10) res.push({pts:pts,nrm:nrm,cum:cum,total:total});
+    }
+    contours=res;
   }
 
-  function computeField(){
+  // ================= mask sources =================
+  function maskCoverage(){ var c=0; for(var i=0;i<SW*SH;i++) if(MASK[i]>0.5)c++; return c/(SW*SH); }
+
+  // heuristic fallback: sharp-edge fill -> solid mask
+  function heuristicMask(){
     if(video.readyState<2) return;
     sctx.drawImage(video,0,0,SW,SH);
     var img; try{ img=sctx.getImageData(0,0,SW,SH).data; }catch(e){ return; }
-    var gray=computeField._g||(computeField._g=new Float32Array(SW*SH));
+    var gray=heuristicMask._g||(heuristicMask._g=new Float32Array(SW*SH));
     for(var i=0,p=0;i<SW*SH;i++,p+=4) gray[i]=(img[p]*0.299+img[p+1]*0.587+img[p+2]*0.114)/255;
-    var maxM=0.0001;
-    for(var y=1;y<SH-1;y++)for(var x=1;x<SW-1;x++){
-      var o=y*SW+x;
+    var maxM=1e-4;
+    for(var y=1;y<SH-1;y++)for(var x=1;x<SW-1;x++){var o=y*SW+x;
       var gx=(gray[o-SW+1]+2*gray[o+1]+gray[o+SW+1])-(gray[o-SW-1]+2*gray[o-1]+gray[o+SW-1]);
       var gy=(gray[o+SW-1]+2*gray[o+SW]+gray[o+SW+1])-(gray[o-SW-1]+2*gray[o-SW]+gray[o-SW+1]);
-      var m=Math.sqrt(gx*gx+gy*gy); TMP[o]=m; if(m>maxM)maxM=m;
-    }
-    for(var k=0;k<SW*SH;k++) SOLID[k]=(TMP[k]/maxM)>EDGE_TH?1:0;
-    morph(SOLID,FL,CLOSE,true); morph(SOLID,FL,CLOSE,false);   // close -> filled solid (FL used as scratch)
-    // smooth occupancy field that reaches out around the object (for the flow to wrap through)
-    for(var h=0;h<SW*SH;h++) FL[h]=SOLID[h];
-    boxBlur(FL,TMP,HALO); boxBlur(FL,TMP,Math.round(HALO*0.6));
-    for(var y2=1;y2<SH-1;y2++)for(var x2=1;x2<SW-1;x2++){
-      var oo=y2*SW+x2; OGX[oo]=(FL[oo+1]-FL[oo-1])*0.5; OGY[oo]=(FL[oo+SW]-FL[oo-SW])*0.5;
-    }
+      var m=Math.sqrt(gx*gx+gy*gy); TMP[o]=m; if(m>maxM)maxM=m;}
+    for(var k=0;k<SW*SH;k++) RAW[k]=(TMP[k]/maxM)>0.18?1:0;
+    morph(RAW,TMP,7,true); morph(RAW,TMP,7,false);
+    for(var e=0;e<SW*SH;e++) MASK[e]=MASK[e]*0.5+RAW[e]*0.5;
   }
-  function samp(f,px,py){ var x=px/W*SW|0,y=py/H*SH|0; if(x<0||y<0||x>=SW||y>=SH)return 0; return f[y*SW+x]; }
-  function grad(px,py,out){ var x=px/W*SW|0,y=py/H*SH|0; if(x<1||y<1||x>=SW-1||y>=SH-1){out[0]=0;out[1]=0;return;} var o=y*SW+x; out[0]=OGX[o]; out[1]=OGY[o]; }
+  function morph(src,dst,r,isMax){var x,y,k,v,idx;
+    for(y=0;y<SH;y++){var row=y*SW;for(x=0;x<SW;x++){v=isMax?-1:2;for(k=-r;k<=r;k++){idx=row+Math.max(0,Math.min(SW-1,x+k));var s=src[idx];if(isMax){if(s>v)v=s;}else{if(s<v)v=s;}}dst[row+x]=v;}}
+    for(x=0;x<SW;x++){for(y=0;y<SH;y++){v=isMax?-1:2;for(k=-r;k<=r;k++){idx=Math.max(0,Math.min(SH-1,y+k))*SW+x;var s2=dst[idx];if(isMax){if(s2>v)v=s2;}else{if(s2<v)v=s2;}}src[y*SW+x]=v;}}}
 
-  // ---- streaks ----
-  var P=[], g=[0,0];
-  function spawn(pt){
-    // spawn on the RIGHT edge of the object (solid is to the LEFT -> gradient.x < 0), in the halo band
-    var tries=0, ok=false;
-    while(tries++<12){
-      var rx=Math.random()*W, ry=Math.random()*H;
-      var f=samp(FL,rx,ry); grad(rx,ry,g);
-      if(f>0.10 && f<0.5 && g[0]<-0.002){ pt.x=rx+6; pt.y=ry; ok=true; break; }
-    }
-    if(!ok){ pt.x=W+30; pt.y=Math.random()*H; }
-    pt.vx=-SPEED; pt.vy=0; pt.hist.length=0; pt.energy=0;
-    pt.life=0; pt.max=120+Math.random()*160; pt.tmax=40+((Math.random()*34)|0);
+  // MediaPipe selfie segmentation -> soft mask, temporally smoothed
+  var seg=null;
+  function onSeg(res){
+    if(!res||!res.segmentationMask) return;
+    try{ sctx.drawImage(res.segmentationMask,0,0,SW,SH); }catch(e){ return; }
+    var d; try{ d=sctx.getImageData(0,0,SW,SH).data; }catch(e){ return; }
+    for(var i=0,p=0;i<SW*SH;i++,p+=4){ var v=d[p]/255; RAW[i]=v; MASK[i]=MASK[i]*0.6+v*0.4; }
+    var cov=maskCoverage();
+    useSeg=(cov>0.015 && cov<0.85);   // trust seg only when it found a sensible-sized subject
   }
-  function seed(){ P.length=0; for(var i=0;i<N;i++){ var pt={x:0,y:0,vx:0,vy:0,hist:[],energy:0,life:0,max:140,tmax:52}; spawn(pt); P.push(pt);} }
+  async function segTick(){
+    if(!running) return;
+    if(seg && video.readyState>=2 && !document.hidden){ try{ await seg.send({image:video}); }catch(e){} }
+    setTimeout(segTick, 70);
+  }
 
+  // ================= render =================
   var running=false,t=0,fieldTick=0;
   var dfEl=document.getElementById('rDf'),flEl=document.getElementById('rFl');
   var dfShown=0,flShown=0;
 
+  function drawStrand(c, off, phase, aMul){
+    var pts=c.pts,nrm=c.nrm,cum=c.cum, n=pts.length;
+    ctx.beginPath();
+    for(var i=0;i<n;i++){
+      var billow=Math.sin(cum[i]*0.045 + phase)*BILLOW*0.5 + Math.sin(cum[i]*0.017 - phase*0.6)*BILLOW*0.5;
+      var o=off+billow;
+      var x=pts[i][0]+nrm[i][0]*o, y=pts[i][1]+nrm[i][1]*o;
+      if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  }
+
   function frame(){
     if(!running) return;
-    t++; tiltY+=(tTiltY-tiltY)*0.06;
-    if((fieldTick++ %3)===0) computeField();
+    t++;
+    if(useSeg){ if((fieldTick++ %3)===0) buildContours(); }
+    else { heuristicMask(); if((fieldTick++ %3)===0) buildContours(); }
 
     ctx.clearRect(0,0,W,H);
-    ctx.globalCompositeOperation='lighter'; ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.globalCompositeOperation='lighter'; ctx.lineCap='round'; ctx.lineJoin='round'; ctx.setLineDash([]);
 
-    for(var i=0;i<P.length;i++){
-      var pt=P[i];
-      var f=samp(FL,pt.x,pt.y);
-      grad(pt.x,pt.y,g);
-      var gl=Math.hypot(g[0],g[1]);
-      var bx=-1, by=0;                                  // base flow: right -> left
-      if(gl>1e-4){
-        var nx=-g[0]/gl, ny=-g[1]/gl;                   // outward normal (points AWAY from object)
-        var tx=-ny, ty=nx;                              // tangent along the outline
-        if(tx>0){ tx=-tx; ty=-ty; }                     // keep the orbit heading leftward
-        var w=Math.min(1, gl*10);                       // stronger hug near the outline
-        var rep=(f>0.30)?(f-0.30)*REPEL:0;              // shove out if it touches the body
-        bx = -1*(1-0.75*w) + tx*SWIRL*w + nx*rep;
-        by =  0            + ty*SWIRL*w + ny*rep;
+    for(var ci=0; ci<contours.length; ci++){
+      var c=contours[ci];
+      // 1) soft continuous glow for the whole bundle (no cuts)
+      for(var s=0;s<STRANDS;s++){
+        var off=GAP + s*SPACING;
+        var ph = t*0.03 + s*0.5;
+        ctx.strokeStyle='rgba(255,242,0,0.05)'; ctx.lineWidth=10; drawStrand(c,off,ph,1);
+        ctx.strokeStyle='rgba(255,244,120,0.5)'; ctx.lineWidth=1.4; drawStrand(c,off,ph,1);
       }
-      var bl=Math.hypot(bx,by)||1;
-      var tvx=bx/bl*SPEED, tvy=by/bl*SPEED;
-      pt.vx+=(tvx-pt.vx)*0.20; pt.vy+=(tvy-pt.vy)*0.20;
-      pt.x+=pt.vx; pt.y+=pt.vy;
-      pt.hist.push(pt.x,pt.y);
-      if(pt.hist.length>pt.tmax*2) pt.hist.splice(0,2);
-      pt.life++;
-
-      if(pt.life>pt.max || pt.x<-90 || pt.x>W+120 || pt.y<-110 || pt.y>H+110){ spawn(pt); continue; }
-      var hh=pt.hist; if(hh.length<8) continue;
-
-      // opacity: only in the halo band around the object; smoothly eased so lines never cut
-      var band=samp(FL,pt.x,pt.y);
-      var aObj=(band-0.05)/0.4; if(aObj<0)aObj=0; if(aObj>1)aObj=1;   // fade far from object -> clean background
-      if(band>0.7) aObj*=0.2;                                        // dim anything that ends up over the body
-      pt.energy+=(aObj-pt.energy)*0.10;
-      var aIn=Math.min(1,pt.life/20), aOut=Math.min(1,(pt.max-pt.life)/28);
-      var a=pt.energy*aIn*aOut;
-      if(a<=0.012) continue;
-
-      ctx.beginPath(); ctx.moveTo(hh[0],hh[1]);
-      for(var j=2;j<hh.length;j+=2) ctx.lineTo(hh[j],hh[j+1]);
-      ctx.strokeStyle='rgba(255,242,0,'+(a*0.13)+')'; ctx.lineWidth=6; ctx.stroke();
-      ctx.strokeStyle='rgba(255,246,140,'+(a*0.85)+')'; ctx.lineWidth=1.5; ctx.stroke();
+      // 2) light TRAVELLING around the outline (bright pulses over the continuous base)
+      ctx.setLineDash([16, Math.max(40,c.total*0.25)]);
+      ctx.lineDashOffset = -(t*FLOWSPEED) % 100000;
+      ctx.strokeStyle='rgba(255,255,255,0.9)'; ctx.lineWidth=2.0; drawStrand(c, GAP+2*SPACING, t*0.03+1.0, 1);
+      ctx.setLineDash([22, Math.max(60,c.total*0.3)]);
+      ctx.lineDashOffset = -(t*FLOWSPEED*0.8 + c.total*0.4) % 100000;
+      ctx.strokeStyle='rgba(255,255,220,0.6)'; ctx.lineWidth=1.4; drawStrand(c, GAP+4*SPACING, t*0.03+2.0, 1);
+      ctx.setLineDash([]);
     }
 
-    var targetDf=380+Math.round(Math.abs(tiltY)*260+Math.sin(t*0.03)*18);
-    var targetFl=210+Math.round(Math.abs(tiltY)*120+Math.cos(t*0.04)*10);
+    var targetDf=380+Math.round(Math.sin(t*0.03)*30+40);
+    var targetFl=210+Math.round(Math.cos(t*0.04)*20+30);
     dfShown+=(targetDf-dfShown)*0.08; flShown+=(targetFl-flShown)*0.08;
     dfEl.textContent=String(Math.round(dfShown)).padStart(3,'0');
     flEl.textContent=String(Math.round(flShown)).padStart(3,'0');
@@ -229,16 +256,24 @@
   function showErr(m){ errEl.textContent=m; errEl.classList.add('on'); }
   async function begin(){
     try{
-      if(typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function'){
-        var s=await DeviceOrientationEvent.requestPermission();
-        if(s==='granted') window.addEventListener('deviceorientation',onOrient,true);
-      } else { window.addEventListener('deviceorientation',onOrient,true); }
+      if(typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function'){ await DeviceOrientationEvent.requestPermission(); }
     }catch(e){}
     try{
       var stream=await navigator.mediaDevices.getUserMedia({ video:{ facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720} }, audio:false });
       video.srcObject=stream; await video.play();
     }catch(e){ showErr('Camera blocked. Allow camera access, then reload. (HTTPS required.)'); return; }
-    seed(); gate.classList.add('hide'); hud.classList.add('on'); running=true; requestAnimationFrame(frame);
+
+    // try to spin up segmentation; if the library isn't there, we silently use the heuristic
+    try{
+      if(typeof SelfieSegmentation!=='undefined'){
+        seg=new SelfieSegmentation({locateFile:function(f){return 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/'+f;}});
+        seg.setOptions({modelSelection:1, selfieMode:false});
+        seg.onResults(onSeg);
+        segTick();
+      }
+    }catch(e){ seg=null; }
+
+    gate.classList.add('hide'); hud.classList.add('on'); running=true; requestAnimationFrame(frame);
   }
   document.getElementById('go').addEventListener('click',begin);
 })();
