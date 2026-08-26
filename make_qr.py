@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 import os
 
 # ---- EDIT THIS to your live HTTPS url once deployed ----
-URL = "https://lotus-ground-effect.netlify.app"
+URL = "https://f1-ar-lotus.netlify.app"
 
 BLACK  = (15, 15, 15)
 YELLOW = (255, 242, 0)
