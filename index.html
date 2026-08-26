@@ -89,27 +89,26 @@
   var sc=document.createElement('canvas');
   var sctx=sc.getContext('2d',{willReadFrequently:true});
   var SW=0,SH=0;
-  var OB=null, TMP=null, OGX=null, OGY=null;   // obstacle cloud + blur temp + gradient
-  var SEEDS=[];                                // spawn points that sit ON objects
+  var SOLID=null, NEAR=null, A=null, B=null, OGX=null, OGY=null;
 
   // ---- tunables ----
-  var N=150;            // streaks alive at once
-  var TRAIL=20;         // points per streak (length of the ribbon)
-  var SPEED=2.6;        // right-to-left flow speed (px/frame)
-  var BEND=16;          // how hard air wraps over/around the object
-  var SENS=3.0;         // obstacle sensitivity (higher = grabs softer objects)
-  var BLUR=3;           // obstacle smoothing (broader wrap)
-  var SEED_TH=0.14;     // how much "object" a spot needs to spawn air there
-  var SHOW_TH=0.10;     // below this the streak fades out (keeps empty scene clean)
+  var N=90;             // streaks alive at once
+  var SPEED=2.4;        // right-to-left flow speed
+  var BENDY=42;         // vertical wrap strength (over / under the object)
+  var BENDX=10;         // horizontal compression
+  var EDGE_TH=0.17;     // how sharp an edge must be to count as "foreground object"
+  var CLOSE=8;          // morphological close radius -> fills the object into a solid
+  var HALO=9;           // glow halo blur radius around the object
 
   function resize(){
     W=window.innerWidth; H=window.innerHeight;
     canvas.width=W*DPR; canvas.height=H*DPR;
     canvas.style.width=W+'px'; canvas.style.height=H+'px';
     ctx.setTransform(DPR,0,0,DPR,0,0);
-    SW=160; SH=Math.max(50,Math.round(SW*H/W));
+    SW=150; SH=Math.max(50,Math.round(SW*H/W));
     sc.width=SW; sc.height=SH;
-    OB=new Float32Array(SW*SH); TMP=new Float32Array(SW*SH);
+    SOLID=new Float32Array(SW*SH); NEAR=new Float32Array(SW*SH);
+    A=new Float32Array(SW*SH); B=new Float32Array(SW*SH);
     OGX=new Float32Array(SW*SH); OGY=new Float32Array(SW*SH);
   }
   window.addEventListener('resize',resize); resize();
@@ -117,19 +116,32 @@
   var tiltY=0,tTiltY=0;
   function onOrient(e){ if(e.beta!=null) tTiltY=Math.max(-1,Math.min(1,(e.beta-45)/45)); }
 
-  function boxBlur(src,dst,r){
-    for(var y=0;y<SH;y++){
-      var row=y*SW, acc=0;
-      for(var x=-r;x<=r;x++) acc+=src[row+Math.max(0,Math.min(SW-1,x))];
-      for(var x2=0;x2<SW;x2++){ dst[row+x2]=acc/(2*r+1);
-        acc+=src[row+Math.min(SW-1,x2+r+1)]-src[row+Math.max(0,x2-r)]; }
+  // separable min/max (erode/dilate) : src->dst
+  function morph(src,dst,r,isMax){
+    var i,x,y,v,k,idx;
+    for(y=0;y<SH;y++){ var row=y*SW;
+      for(x=0;x<SW;x++){ v=isMax?-1:2;
+        for(k=-r;k<=r;k++){ idx=row+Math.max(0,Math.min(SW-1,x+k)); var s=src[idx];
+          if(isMax){ if(s>v)v=s; } else { if(s<v)v=s; } }
+        dst[row+x]=v; }
     }
-    for(var x3=0;x3<SW;x3++){
-      var acc2=0;
-      for(var y3=-r;y3<=r;y3++) acc2+=dst[Math.max(0,Math.min(SH-1,y3))*SW+x3];
-      for(var y4=0;y4<SH;y4++){ src[y4*SW+x3]=acc2/(2*r+1);
-        acc2+=dst[Math.min(SH-1,y4+r+1)*SW+x3]-dst[Math.max(0,y4-r)*SW+x3]; }
+    for(x=0;x<SW;x++){
+      for(y=0;y<SH;y++){ v=isMax?-1:2;
+        for(k=-r;k<=r;k++){ idx=Math.max(0,Math.min(SH-1,y+k))*SW+x; var s2=dst[idx];
+          if(isMax){ if(s2>v)v=s2; } else { if(s2<v)v=s2; } }
+        src[y*SW+x]=v; }   // write back into src (in place)
     }
+  }
+  function boxBlur(a,tmp,r){
+    var x,y,k,acc;
+    for(y=0;y<SH;y++){ var row=y*SW; acc=0;
+      for(k=-r;k<=r;k++) acc+=a[row+Math.max(0,Math.min(SW-1,k))];
+      for(x=0;x<SW;x++){ tmp[row+x]=acc/(2*r+1);
+        acc+=a[row+Math.min(SW-1,x+r+1)]-a[row+Math.max(0,x-r)]; } }
+    for(x=0;x<SW;x++){ acc=0;
+      for(k=-r;k<=r;k++) acc+=tmp[Math.max(0,Math.min(SH-1,k))*SW+x];
+      for(y=0;y<SH;y++){ a[y*SW+x]=acc/(2*r+1);
+        acc+=tmp[Math.min(SH-1,y+r+1)*SW+x]-tmp[Math.max(0,y-r)*SW+x]; } }
   }
 
   function computeField(){
@@ -138,47 +150,49 @@
     var img; try{ img=sctx.getImageData(0,0,SW,SH).data; }catch(e){ return; }
     var gray=computeField._g||(computeField._g=new Float32Array(SW*SH));
     for(var i=0,p=0;i<SW*SH;i++,p+=4) gray[i]=(img[p]*0.299+img[p+1]*0.587+img[p+2]*0.114)/255;
+    // sharp-edge mask (foreground = in focus, high contrast)
     var maxM=0.0001;
     for(var y=1;y<SH-1;y++)for(var x=1;x<SW-1;x++){
       var o=y*SW+x;
       var gx=(gray[o-SW+1]+2*gray[o+1]+gray[o+SW+1])-(gray[o-SW-1]+2*gray[o-1]+gray[o+SW-1]);
       var gy=(gray[o+SW-1]+2*gray[o+SW]+gray[o+SW+1])-(gray[o-SW-1]+2*gray[o-SW]+gray[o-SW+1]);
-      var m=Math.sqrt(gx*gx+gy*gy); OB[o]=m; if(m>maxM)maxM=m;
+      var m=Math.sqrt(gx*gx+gy*gy); A[o]=m; if(m>maxM)maxM=m;
     }
-    for(var k=0;k<SW*SH;k++) OB[k]=Math.min(1,(OB[k]/maxM)*SENS);
-    boxBlur(OB,TMP,BLUR); boxBlur(OB,TMP,BLUR);
+    for(var k=0;k<SW*SH;k++) SOLID[k]=(A[k]/maxM)>EDGE_TH?1:0;
+    // morphological CLOSE (dilate then erode) -> fills the object interior into a solid mass
+    morph(SOLID,B,CLOSE,true);   // dilate
+    morph(SOLID,B,CLOSE,false);  // erode  (back to size, holes filled)
+    boxBlur(SOLID,B,2);          // soften the silhouette a touch
+    // halo field for the glow around the object
+    for(var h=0;h<SW*SH;h++) NEAR[h]=SOLID[h];
+    boxBlur(NEAR,B,HALO); boxBlur(NEAR,B,HALO);
+    // gradient of the solid (points inward -> we flow along -gradient, i.e. around it)
     for(var y2=1;y2<SH-1;y2++)for(var x2=1;x2<SW-1;x2++){
       var oo=y2*SW+x2;
-      OGX[oo]=(OB[oo+1]-OB[oo-1])*0.5;
-      OGY[oo]=(OB[oo+SW]-OB[oo-SW])*0.5;
-    }
-    // rebuild spawn points that sit on the object
-    SEEDS.length=0;
-    for(var yy=2;yy<SH-2;yy+=2)for(var xx=2;xx<SW-2;xx+=2){
-      if(OB[yy*SW+xx]>SEED_TH){ SEEDS.push(xx/SW*W, yy/SH*H); }
+      OGX[oo]=(SOLID[oo+1]-SOLID[oo-1])*0.5;
+      OGY[oo]=(SOLID[oo+SW]-SOLID[oo-SW])*0.5;
     }
   }
-  function sampleOB(px,py){ var x=px/W*SW|0,y=py/H*SH|0; if(x<0||y<0||x>=SW||y>=SH)return 0; return OB[y*SW+x]; }
-  function gradAt(px,py,out){
-    var x=px/W*SW|0,y=py/H*SH|0;
-    if(x<1||y<1||x>=SW-1||y>=SH-1){out[0]=0;out[1]=0;return;}
-    var o=y*SW+x; out[0]=OGX[o]; out[1]=OGY[o];
-  }
+  function samp(field,px,py){ var x=px/W*SW|0,y=py/H*SH|0; if(x<0||y<0||x>=SW||y>=SH)return 0; return field[y*SW+x]; }
+  function gradAt(px,py,out){ var x=px/W*SW|0,y=py/H*SH|0; if(x<1||y<1||x>=SW-1||y>=SH-1){out[0]=0;out[1]=0;return;} var o=y*SW+x; out[0]=OGX[o]; out[1]=OGY[o]; }
 
   // ---- streaks ----
   var P=[], g=[0,0];
-  function spawn(pt){
-    if(SEEDS.length>=2){
-      var i=(Math.random()*(SEEDS.length/2))|0;
-      // start a little to the RIGHT of the object so it flows leftward across it
-      pt.x=SEEDS[i*2]+ 40+Math.random()*90;
-      pt.y=SEEDS[i*2+1]+(Math.random()-0.5)*18;
-    }else{ pt.x=Math.random()*W; pt.y=Math.random()*H; }
+  function spawn(pt,anywhere){
+    // spawn in the halo AROUND the object, on its right side, so it flows left across/around it
+    var tries=0, ok=false;
+    while(tries++<8){
+      var rx=Math.random()*W, ry=Math.random()*H;
+      var nearV=samp(NEAR,rx,ry), solV=samp(SOLID,rx,ry);
+      if(nearV>0.10 && solV<0.5){ pt.x=rx+30+Math.random()*70; pt.y=ry; ok=true; break; }
+    }
+    if(!ok){ pt.x=W+40; pt.y=Math.random()*H; }
     pt.vx=-SPEED; pt.vy=0;
-    pt.hist.length=0;
-    pt.life=0; pt.max=45+Math.random()*90;      // half-life: streaks come and go
+    pt.hist.length=0; pt.energy=0;
+    pt.life=0; pt.max=90+Math.random()*140;              // half-life, varied
+    pt.tmax=34+((Math.random()*30)|0);                    // varied length (in points)
   }
-  function seed(){ P.length=0; for(var i=0;i<N;i++){ var pt={x:0,y:0,vx:0,vy:0,hist:[],life:0,max:60}; spawn(pt); P.push(pt);} }
+  function seed(){ P.length=0; for(var i=0;i<N;i++){ var pt={x:0,y:0,vx:0,vy:0,hist:[],energy:0,life:0,max:120,tmax:44}; spawn(pt); P.push(pt);} }
 
   var running=false,t=0,fieldTick=0;
   var dfEl=document.getElementById('rDf'),flEl=document.getElementById('rFl');
@@ -187,7 +201,7 @@
   function frame(){
     if(!running) return;
     t++; tiltY+=(tTiltY-tiltY)*0.06;
-    if((fieldTick++ %2)===0) computeField();
+    if((fieldTick++ %3)===0) computeField();
 
     ctx.clearRect(0,0,W,H);
     ctx.globalCompositeOperation='lighter';
@@ -196,37 +210,35 @@
     for(var i=0;i<P.length;i++){
       var pt=P[i];
       gradAt(pt.x,pt.y,g);
-      // right-to-left base flow + wrap over/around the object
-      var tvx = -SPEED - g[0]*BEND*0.35;
-      var tvy = -g[1]*BEND;
-      pt.vx += (tvx-pt.vx)*0.25;
-      pt.vy += (tvy-pt.vy)*0.25;
-      pt.x += pt.vx; pt.y += pt.vy;
+      var solHere=samp(SOLID,pt.x,pt.y);
+      // right-to-left flow that wraps AROUND the solid (flow along -gradient)
+      var tvx=-SPEED - g[0]*BENDX;
+      var tvy=-g[1]*BENDY;
+      if(solHere>0.5){ tvx += -g[0]*BENDX*4; tvy += -g[1]*BENDY*3; }  // collision: escape the body
+      pt.vx+=(tvx-pt.vx)*0.22; pt.vy+=(tvy-pt.vy)*0.22;
+      var vlim=SPEED*1.7; if(pt.vy>vlim)pt.vy=vlim; if(pt.vy<-vlim)pt.vy=-vlim;
+      pt.x+=pt.vx; pt.y+=pt.vy;
       pt.hist.push(pt.x,pt.y);
-      if(pt.hist.length>TRAIL*2) pt.hist.splice(0,2);
+      if(pt.hist.length>pt.tmax*2) pt.hist.splice(0,2);
       pt.life++;
 
-      // recycle
-      if(pt.life>pt.max || pt.x<-60 || pt.x>W+120 || pt.y<-80 || pt.y>H+80){ spawn(pt); continue; }
+      if(pt.life>pt.max || pt.x<-80 || pt.x>W+140 || pt.y<-100 || pt.y>H+100){ spawn(pt); continue; }
+      var hh=pt.hist; if(hh.length<8) continue;
 
-      var h=pt.hist; if(h.length<6) continue;
-
-      // alpha: near-object presence * soft birth/death fade  (empty scene -> ~0)
-      var ob=sampleOB(pt.x,pt.y);
-      var aObj=(ob-SHOW_TH)/(0.45-SHOW_TH); if(aObj<0)aObj=0; if(aObj>1)aObj=1;
-      var aIn=Math.min(1,pt.life/10), aOut=Math.min(1,(pt.max-pt.life)/14);
+      // opacity from proximity to the object (halo) -> smoothly eased so lines never CUT
+      var eT=samp(NEAR,pt.x,pt.y);
+      pt.energy+=(eT-pt.energy)*0.10;
+      var aObj=(pt.energy-0.05)/0.45; if(aObj<0)aObj=0; if(aObj>1)aObj=1;
+      var aIn=Math.min(1,pt.life/18), aOut=Math.min(1,(pt.max-pt.life)/26);
       var a=aObj*aIn*aOut;
       if(a<=0.01) continue;
 
-      // draw this streak: soft yellow bloom + warm core
-      ctx.beginPath();
-      ctx.moveTo(h[0],h[1]);
-      for(var j=2;j<h.length;j+=2) ctx.lineTo(h[j],h[j+1]);
-      ctx.strokeStyle='rgba(255,242,0,'+(a*0.18)+')'; ctx.lineWidth=7; ctx.stroke();
-      ctx.strokeStyle='rgba(255,244,120,'+(a*0.9)+')'; ctx.lineWidth=1.6; ctx.stroke();
-      // bright leading head (the front of the moving air)
-      ctx.fillStyle='rgba(255,255,255,'+(a*0.9)+')';
-      ctx.beginPath(); ctx.arc(pt.x,pt.y,1.6,0,6.283); ctx.fill();
+      // draw one long continuous streak: soft bloom + warm core, taper the tail with two passes
+      var x0=hh[0],y0=hh[1];
+      ctx.beginPath(); ctx.moveTo(x0,y0);
+      for(var j=2;j<hh.length;j+=2) ctx.lineTo(hh[j],hh[j+1]);
+      ctx.strokeStyle='rgba(255,242,0,'+(a*0.14)+')'; ctx.lineWidth=6; ctx.stroke();
+      ctx.strokeStyle='rgba(255,246,140,'+(a*0.85)+')'; ctx.lineWidth=1.5; ctx.stroke();
     }
 
     var targetDf=380+Math.round(Math.abs(tiltY)*260+Math.sin(t*0.03)*18);
